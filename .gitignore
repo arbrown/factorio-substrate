@@ -1,0 +1,13 @@
+# Git worktrees used for parallel feature development
+.worktree/
+
+# Local environment overrides and credentials
+.ate-dev-env.sh
+*.kubeconfig
+
+# Built binaries and artifacts
+bin/
+dist/
+*.test
+*.out
+coverage.txt
