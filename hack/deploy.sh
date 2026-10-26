@@ -28,8 +28,9 @@ fi
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-10m}"
 
+KO_BIN="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh --print-bin-path ko)"
 run_ko() {
-  "${SUBSTRATE_REPO}/hack/run-tool.sh" ko "$@"
+  "${KO_BIN}" "$@"
 }
 
 run_kubectl_ate() {
