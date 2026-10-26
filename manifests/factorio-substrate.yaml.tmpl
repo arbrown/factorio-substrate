@@ -1,0 +1,149 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: factorio
+---
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: factorio
+  namespace: factorio
+  labels:
+    workload: factorio
+spec:
+  # Single physical warm worker pod that multiplexes multiple Factorio worlds
+  # (e.g. world-vanilla and world-deathworld) on demand.
+  replicas: 1
+  workerImage: ${WORKER_IMAGE}
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    resources:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        memory: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: factorio-gateway
+  namespace: factorio
+  labels:
+    app: factorio-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: factorio-gateway
+  template:
+    metadata:
+      labels:
+        app: factorio-gateway
+    spec:
+      containers:
+      - name: gateway
+        image: ko://github.com/arbrown/factorio-substrate/cmd/factorio-gateway
+        args:
+        - "--routes=34197=factorio/world-vanilla,34198=factorio/world-deathworld"
+        - "--idle-timeout=${IDLE_TIMEOUT}"
+        - "--ws-rotate-interval=4m"
+        - "--preempt-idle-grace=5s"
+        - "--max-active-worlds=1"
+        - "--router-http-addr=atenet-router.ate-system.svc.cluster.local:80"
+        - "--ateapi-address=api.ate-system.svc.cluster.local:443"
+        - "--ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem"
+        - "--ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+        - "--ateapi-server-name=api.ate-system.svc"
+        ports:
+        - name: udp-vanilla
+          containerPort: 34197
+          protocol: UDP
+        - name: udp-deathworld
+          containerPort: 34198
+          protocol: UDP
+        - name: http-status
+          containerPort: 8080
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+      volumes:
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      - name: servicedns-ca
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: factorio-gateway
+  namespace: factorio
+spec:
+  type: LoadBalancer
+  selector:
+    app: factorio-gateway
+  ports:
+  - name: factorio-vanilla
+    port: 34197
+    targetPort: 34197
+    protocol: UDP
+  - name: factorio-deathworld
+    port: 34198
+    targetPort: 34198
+    protocol: UDP
+  - name: status-http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
