@@ -69,10 +69,16 @@ fi
 
 echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready)..."
 if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
-  READY="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshot.ready // false')"
-  if [[ "${READY}" != "true" ]]; then
-    echo "    Existing factorio-server ActorTemplate is not Ready; recreating..."
+  SNAP_URI="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshot.snapshotUri // empty')"
+  if [[ -z "${SNAP_URI}" ]]; then
+    OLD_UID="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.metadata.uid // empty')"
+    echo "    Existing factorio-server ActorTemplate (${OLD_UID}) is not Ready; recreating..."
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
+    if [[ -n "${OLD_UID}" ]]; then
+      kubectl exec -n ate-system postgres-0 -c postgres -- psql -U postgres -d atepg -c "DELETE FROM worker_assignments; DELETE FROM workers; DELETE FROM actors WHERE name = '${OLD_UID}';" >/dev/null 2>&1 || true
+      kubectl delete pod -n factorio -l workload=factorio --wait=false >/dev/null 2>&1 || true
+      kubectl rollout status deployment/factorio -n factorio --timeout=120s
+    fi
     sleep 2
   fi
 fi

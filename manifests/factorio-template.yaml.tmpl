@@ -29,17 +29,15 @@ containers:
   - "--listen-addr=:80"
   - "--factorio-udp-addr=127.0.0.1:34197"
   - "--factorio-rcon-addr=127.0.0.1:27015"
-  - "--factorio-dir=/factorio"
+  - "--factorio-dir="
+  - "--rcon-password=substrate-factorio-rcon"
   - "--system-info-dir=/run/ate"
-  - "--require-user-verification=false"
   readyz:
     httpGet:
       path: /readyz
       port: 80
     timeoutSeconds: 180
   volumeMounts:
-  - name: factorio-data
-    mountPath: /factorio
   - name: system-info
     mountPath: /run/ate
 - name: factorio
@@ -48,21 +46,22 @@ containers:
   - /bin/bash
   - -ec
   - |
-    while [ ! -f /factorio/config/.initialized ]; do
-      sleep 0.1
-    done
-    if [ ! -f /factorio/config/map-gen-settings.json ]; then
-      cp /opt/factorio/data/map-gen-settings.example.json /factorio/config/map-gen-settings.json
+    mkdir -p /factorio/saves /factorio/config /factorio/mods /factorio/scenarios /factorio/script-output
+    printf "[path]\nread-data=__PATH__executable__/../../data\nwrite-data=/factorio\n" > /factorio/config/config.ini
+    if [ ! -f /factorio/config/server-settings.json ]; then
+      sed \
+        -e 's/"public": true/"public": false/g' \
+        -e 's/"lan": true/"lan": false/g' \
+        -e 's/"require_user_verification": true/"require_user_verification": false/g' \
+        /opt/factorio/data/server-settings.example.json > /factorio/config/server-settings.json
     fi
-    if [ ! -f /factorio/config/map-settings.json ]; then
-      cp /opt/factorio/data/map-settings.example.json /opt/factorio/config/map-settings.json
+    if [ ! -f /factorio/config/server-adminlist.json ]; then
+      printf '[\n  "drewbr"\n]\n' > /factorio/config/server-adminlist.json
     fi
     if [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
       /opt/factorio/bin/x64/factorio \
         -c /factorio/config/config.ini \
-        --create /factorio/saves/_autosave1.zip \
-        --map-gen-settings /factorio/config/map-gen-settings.json \
-        --map-settings /factorio/config/map-settings.json
+        --create /factorio/saves/_autosave1.zip
     fi
     exec /opt/factorio/bin/x64/factorio \
       -c /factorio/config/config.ini \
@@ -70,7 +69,7 @@ containers:
       --server-settings /factorio/config/server-settings.json \
       --server-adminlist /factorio/config/server-adminlist.json \
       --rcon-bind 127.0.0.1:27015 \
-      --rcon-password "$(cat /factorio/config/rconpw)" \
+      --rcon-password "substrate-factorio-rcon" \
       --server-id /factorio/config/server-id.json \
       --mod-directory /factorio/mods \
       --start-server-load-latest
