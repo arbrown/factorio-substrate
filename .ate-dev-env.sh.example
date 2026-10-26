@@ -1,0 +1,10 @@
+# Copy this file to .ate-dev-env.sh and customize it for your GCP project.
+export PROJECT_ID="your-gcp-project-id"
+export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+export GCE_REGION="us-central1"
+export CLUSTER_LOCATION="us-central1-a"
+export CLUSTER_NAME="factorio-ate"
+export BUCKET_NAME="${PROJECT_ID}-factorio-ate"
+export KO_DOCKER_REPO="gcr.io/${PROJECT_ID}/factorio-ate-images"
+export KO_DEFAULTPLATFORMS="linux/amd64"
+export SUBSTRATE_REPO="/path/to/substrate"
