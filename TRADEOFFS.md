@@ -69,8 +69,23 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
   1. **Instant On-Demand Activation:** Instead of waiting minutes for GKE Autopilot to provision a Spot VM and cold-boot Factorio, players connect directly from the Factorio game client and resume from GCS in seconds.
   2. **N-to-1 World Multiplexing:** A single `replicas: 1` `WorkerPool` pod can host an arbitrary number of Factorio worlds (Vanilla, Space Age, Deathworld, Modded) plus other Substrate actors (like AI coding agents or Jupyter notebooks). Only the currently active world occupies compute; all idle worlds live purely as GCS objects (`gs://.../snapshots/...`) with zero Persistent Disks (`PVC`s) attached.
 
-### Trade-off 7: ConfigMaps & InitContainers in `ActorTemplate`
+### Trade-off 7: ConfigMaps, InitContainers, & gVisor `FileAccess: exclusive` on `durableDir`
 * **The Constraint:**
   - Unlike Kubernetes `Deployment`s, Substrate's `ActorTemplate` does not yet support `initContainers` or `ConfigMap` volume mounts (only `durableDir`, `externalVolumeTemplate`, and `systemInfo`).
+  - Furthermore, inside gVisor (`runsc`), each container in the Actor sandbox runs its own `runsc-gofer` process with `FileAccess: exclusive` enabled by default on bind mounts. If two containers (`sidecar` and `factorio`) both mount the same `durableDir` (`/factorio`) concurrently, gVisor's per-container dentry cache becomes incoherent across the two gofer mounts.
 * **Our Solution:**
-  - `factorio-sidecar` mounts the shared `/factorio` `durableDir` volume and writes `/factorio/config/*.json` (`server-settings.json`, `map-gen-settings.json`, `map-settings.json`, `server-adminlist.json`) and `/factorio/mods/mod-list.json` on startup before Factorio initializes, supporting world presets via flags/env vars.
+  - Only the `factorio` container mounts the `/factorio` `durableDir` volume (preserving gVisor's `FileAccess: exclusive` invariant), and its startup script seeds `/factorio/config/*.json` from `/opt/factorio/data/server-settings.example.json` before invoking `/opt/factorio/bin/x64/factorio`. Meanwhile, `factorio-sidecar` interacts with Factorio purely over actor-local loopback sockets (`127.0.0.1:34197/UDP` and `127.0.0.1:27015/TCP`).
+
+### Trade-off 8: Container Linux Capabilities vs. Upstream `/docker-entrypoint.sh`
+* **The Constraint:**
+  - Agent Substrate containers inside the gVisor sandbox default to only `AUDIT_WRITE`, `KILL`, and `NET_BIND_SERVICE` capabilities (`CAP_SETUID`, `CAP_SETGID`, and `CAP_CHOWN` are not granted by default).
+  - When `factoriotools/factorio:stable` starts as UID 0, its upstream `/docker-entrypoint.sh` attempts to run `usermod`, `groupmod`, `chown -R factorio:factorio /factorio`, and `runuser -u factorio`, which fail without those capabilities.
+* **Our Solution:**
+  - In [`manifests/factorio-template.yaml.tmpl`](manifests/factorio-template.yaml.tmpl), we override `command` on the `factorio` container to wait for `/factorio/config/.initialized` (written by `factorio-sidecar`), run `/opt/factorio/bin/x64/factorio --create /factorio/saves/_autosave1.zip` if no save exists yet, and `exec /opt/factorio/bin/x64/factorio` directly with `-c /factorio/config/config.ini`. This avoids both capability errors and startup race conditions between the two containers.
+
+### Trade-off 9: `atelet` OCI Image Unpacker vs. `ko` Default Base Image
+* **The Constraint:**
+  - When `ko` builds Go binaries without a `.ko.yaml`, it defaults to `cgr.dev/chainguard/static:latest`. That image's rootfs layer includes a `/dev/console` character device tar entry (`tar.TypeChar`, `typeflag "3"`), which `atelet`'s `imageCache.EnsureImage` rejects with `unhandled tar entry typeflag "3"`.
+* **Our Solution:**
+  - We configure [`.ko.yaml`](.ko.yaml) with `defaultBaseImage: gcr.io/distroless/static-debian13:latest`, matching Agent Substrate's own `.ko.yaml` and ensuring all image layers contain only regular files, directories, and symlinks.
+
