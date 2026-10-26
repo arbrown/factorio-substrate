@@ -67,7 +67,15 @@ if ! run_kubectl_ate get atespace factorio >/dev/null 2>&1; then
   run_kubectl_ate create atespace factorio
 fi
 
-echo "==> Creating 'factorio-server' ActorTemplate (if not already present)..."
+echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready)..."
+if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
+  READY="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshot.ready // false')"
+  if [[ "${READY}" != "true" ]]; then
+    echo "    Existing factorio-server ActorTemplate is not Ready; recreating..."
+    run_kubectl_ate delete actor-template factorio-server -a factorio || true
+    sleep 2
+  fi
+fi
 if ! run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
       manifests/factorio-template.yaml.tmpl \
