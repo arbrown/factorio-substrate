@@ -90,6 +90,9 @@ func NewSidecarServer(cfg Config) *SidecarServer {
 // InitFactorioDir seeds /factorio/config and /factorio/mods on the shared
 // durableDir volume and writes /factorio/config/.initialized once complete.
 func (s *SidecarServer) InitFactorioDir() error {
+	if s.cfg.FactorioDir == "" {
+		return nil
+	}
 	for _, sub := range []string{"saves", "config", "mods", "scenarios", "script-output"} {
 		if err := os.MkdirAll(filepath.Join(s.cfg.FactorioDir, sub), 0o777); err != nil {
 			return fmt.Errorf("mkdir %s: %w", sub, err)
