@@ -1,0 +1,109 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for Factorio on
+# Agent Substrate. Applied via `kubectl ate create actor-template -f -`.
+metadata:
+  atespace: factorio
+  name: factorio-server
+workerSelector:
+  matchLabels:
+    workload: factorio
+containers:
+- name: sidecar
+  image: ko://github.com/arbrown/factorio-substrate/cmd/factorio-sidecar
+  command:
+  - /ko-app/factorio-sidecar
+  args:
+  - "--listen-addr=:80"
+  - "--factorio-udp-addr=127.0.0.1:34197"
+  - "--factorio-rcon-addr=127.0.0.1:27015"
+  - "--factorio-dir=/factorio"
+  - "--system-info-dir=/run/ate"
+  - "--require-user-verification=false"
+  readyz:
+    httpGet:
+      path: /readyz
+      port: 80
+  volumeMounts:
+  - name: factorio-data
+    mountPath: /factorio
+  - name: system-info
+    mountPath: /run/ate
+- name: factorio
+  image: "index.docker.io/factoriotools/factorio@sha256:74f41f9450f2ba8464c445fb712f5ca1643a6b92b495c7a1f301bb3f1c7e2940"
+  command:
+  - /bin/bash
+  - -ec
+  - |
+    while [ ! -f /factorio/config/.initialized ]; do
+      sleep 0.1
+    done
+    if [ ! -f /factorio/config/map-gen-settings.json ]; then
+      cp /opt/factorio/data/map-gen-settings.example.json /factorio/config/map-gen-settings.json
+    fi
+    if [ ! -f /factorio/config/map-settings.json ]; then
+      cp /opt/factorio/data/map-settings.example.json /factorio/config/map-settings.json
+    fi
+    if [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
+      /opt/factorio/bin/x64/factorio \
+        -c /factorio/config/config.ini \
+        --create /factorio/saves/_autosave1.zip \
+        --map-gen-settings /factorio/config/map-gen-settings.json \
+        --map-settings /factorio/config/map-settings.json
+    fi
+    exec /opt/factorio/bin/x64/factorio \
+      -c /factorio/config/config.ini \
+      --port 34197 \
+      --server-settings /factorio/config/server-settings.json \
+      --server-adminlist /factorio/config/server-adminlist.json \
+      --rcon-bind 127.0.0.1:27015 \
+      --rcon-password "$(cat /factorio/config/rconpw)" \
+      --server-id /factorio/config/server-id.json \
+      --mod-directory /factorio/mods \
+      --start-server-load-latest
+  readyz:
+    httpGet:
+      path: /readyz
+      port: 80
+  volumeMounts:
+  - name: factorio-data
+    mountPath: /factorio
+resources:
+  limits:
+  - name: cpu
+    quantity: "2"
+  - name: memory
+    quantity: 4Gi
+snapshotsConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: gs://${BUCKET_NAME}/factorio/
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default
+volumes:
+- name: factorio-data
+  durableDir: {}
+- name: system-info
+  systemInfo:
+    dataSources:
+    - actorMetadata:
+        items:
+        - field: name
+          path: actor-name
+        - field: atespace
+          path: atespace
+        - field: uid
+          path: actor-uid

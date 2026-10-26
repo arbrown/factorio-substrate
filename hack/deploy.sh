@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+if [[ -f .ate-dev-env.sh ]]; then
+  source .ate-dev-env.sh
+fi
+
+: "${PROJECT_ID:?PROJECT_ID must be set (see .ate-dev-env.sh.example)}"
+: "${BUCKET_NAME:?BUCKET_NAME must be set (see .ate-dev-env.sh.example)}"
+: "${KO_DOCKER_REPO:?KO_DOCKER_REPO must be set (see .ate-dev-env.sh.example)}"
+SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-10m}"
+
+run_ko() {
+  "${SUBSTRATE_REPO}/hack/run-tool.sh" ko "$@"
+}
+
+run_kubectl_ate() {
+  (cd "${SUBSTRATE_REPO}" && go run ./cmd/kubectl-ate "$@")
+}
+
+echo "==> Resolving Substrate version from cluster atelet DaemonSet..."
+SUBSTRATE_VERSION="$(kubectl get ds -n ate-system -l app=atelet -o jsonpath='{.items[0].metadata.labels.ate\.dev/substrate-version}')"
+if [[ -z "${SUBSTRATE_VERSION}" ]]; then
+  echo "error: could not find atelet DaemonSet in namespace ate-system" >&2
+  exit 1
+fi
+echo "    SUBSTRATE_VERSION=${SUBSTRATE_VERSION}"
+
+echo "==> Building/resolving ateom-gvisor worker image..."
+WORKER_IMAGE="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh ko build ./cmd/ateom-gvisor)"
+echo "    WORKER_IMAGE=${WORKER_IMAGE}"
+
+echo "==> Deploying factorio Namespace, WorkerPool, and UDP Gateway (IDLE_TIMEOUT=${IDLE_TIMEOUT})..."
+sed -e "s|\${SUBSTRATE_VERSION}|${SUBSTRATE_VERSION}|g" \
+    -e "s|\${WORKER_IMAGE}|${WORKER_IMAGE}|g" \
+    -e "s|\${IDLE_TIMEOUT}|${IDLE_TIMEOUT}|g" \
+    manifests/factorio-substrate.yaml.tmpl \
+  | run_ko resolve -f - \
+  | kubectl apply -f -
+
+echo "==> Waiting for WorkerPool and UDP Gateway to roll out..."
+kubectl wait --for=create deployment/factorio -n factorio --timeout=120s
+kubectl rollout status deployment/factorio -n factorio --timeout=300s
+kubectl rollout status deployment/factorio-gateway -n factorio --timeout=300s
+
+echo "==> Ensuring 'factorio' Atespace exists..."
+if ! run_kubectl_ate get atespace factorio >/dev/null 2>&1; then
+  run_kubectl_ate create atespace factorio
+fi
+
+echo "==> Creating 'factorio-server' ActorTemplate (if not already present)..."
+if ! run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
+  sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
+      manifests/factorio-template.yaml.tmpl \
+    | run_ko resolve -f - \
+    | run_kubectl_ate create actor-template -f -
+fi
+
+echo "==> Waiting for 'factorio-server' ActorTemplate Golden Snapshot to become Ready..."
+for i in {1..90}; do
+  STATUS="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json 2>/dev/null || true)"
+  if echo "${STATUS}" | grep -q '"snapshotUri"'; then
+    echo "    Golden Snapshot Ready!"
+    break
+  fi
+  if [[ $i -eq 90 ]]; then
+    echo "error: timed out waiting for Golden Snapshot" >&2
+    echo "${STATUS}" >&2
+    exit 1
+  fi
+  sleep 5
+done
+
+echo "==> Creating Factorio world Actors (world-vanilla and world-deathworld)..."
+for ACTOR in world-vanilla world-deathworld; do
+  if ! run_kubectl_ate get actor "${ACTOR}" -a factorio >/dev/null 2>&1; then
+    run_kubectl_ate create actor "${ACTOR}" -a factorio --template factorio-server
+  fi
+done
+
+echo "==> Current Actors in 'factorio' atespace:"
+run_kubectl_ate get actor -a factorio
+
+echo "==> Factorio Gateway LoadBalancer Service:"
+kubectl get svc -n factorio factorio-gateway
