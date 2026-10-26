@@ -36,6 +36,7 @@ containers:
     httpGet:
       path: /readyz
       port: 80
+    timeoutSeconds: 180
   volumeMounts:
   - name: factorio-data
     mountPath: /factorio
@@ -54,7 +55,7 @@ containers:
       cp /opt/factorio/data/map-gen-settings.example.json /factorio/config/map-gen-settings.json
     fi
     if [ ! -f /factorio/config/map-settings.json ]; then
-      cp /opt/factorio/data/map-settings.example.json /factorio/config/map-settings.json
+      cp /opt/factorio/data/map-settings.example.json /opt/factorio/config/map-settings.json
     fi
     if [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
       /opt/factorio/bin/x64/factorio \
@@ -77,6 +78,7 @@ containers:
     httpGet:
       path: /readyz
       port: 80
+    timeoutSeconds: 180
   volumeMounts:
   - name: factorio-data
     mountPath: /factorio
@@ -101,9 +103,7 @@ volumes:
     dataSources:
     - actorMetadata:
         items:
-        - field: name
+        - field: ACTOR_METADATA_FIELD_NAME
           path: actor-name
-        - field: atespace
+        - field: ACTOR_METADATA_FIELD_ATESPACE
           path: atespace
-        - field: uid
-          path: actor-uid
