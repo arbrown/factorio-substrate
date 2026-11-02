@@ -39,12 +39,8 @@ if [[ "${MODE}" == "--transitions" ]]; then
   echo "[$(date +%H:%M:%S)] Watching Factorio Actors in atespace 'factorio' for state transitions..."
   declare -A prev_line
   while true; do
-    while IFS= read -r line; do
-      [[ -z "${line}" ]] && continue
-      name="$(awk '{print $2}' <<<"${line}")"
-      state="$(awk '{print $4}' <<<"${line}")"
-      pod="$(awk '{print $5}' <<<"${line}")"
-      ver="$(awk '{print $7}' <<<"${line}")"
+    while IFS=$'\t' read -r name state pod ver; do
+      [[ -z "${name}" ]] && continue
       summary="${state} (pod=${pod}, version=${ver})"
       if [[ "${prev_line[${name}]:-}" != "${summary}" ]]; then
         if [[ -n "${prev_line[${name}]:-}" ]]; then
@@ -54,7 +50,7 @@ if [[ "${MODE}" == "--transitions" ]]; then
         fi
         prev_line["${name}"]="${summary}"
       fi
-    done < <("${KUBECTL_ATE_BIN}" get actors -a factorio --no-headers 2>/dev/null || "${KUBECTL_ATE_BIN}" get actors -a factorio 2>/dev/null | tail -n +2)
+    done < <("${KUBECTL_ATE_BIN}" get actors -a factorio -o json 2>/dev/null | jq -r '.items[]? | [.metadata.name, .status.state, (.status.workerAssignment.workerPodNamespace + "/" + .status.workerAssignment.workerPodName | if . == "/" then "<none>" else . end), .metadata.version] | @tsv')
     sleep "${INTERVAL}"
   done
 else
