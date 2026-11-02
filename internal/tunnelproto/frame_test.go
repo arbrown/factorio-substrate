@@ -69,3 +69,35 @@ func TestFactorioPacketClassification(t *testing.T) {
 		t.Errorf("expected 2-byte scanner packet to be rejected")
 	}
 }
+
+func TestVersionParsingAndComparison(t *testing.T) {
+	probe24 := BuildFactorioProbePacketForVersion(999, 2, 1, 24)
+	if v, ok := ParseClientVersion(probe24); !ok || v != "2.1.24" {
+		t.Fatalf("ParseClientVersion(probe24) = %q, %v; want 2.1.24, true", v, ok)
+	}
+
+	probe25 := BuildFactorioProbePacketForVersion(999, 2, 1, 25)
+	if v, ok := ParseClientVersion(probe25); !ok || v != "2.1.25" {
+		t.Fatalf("ParseClientVersion(probe25) = %q, %v; want 2.1.25, true", v, ok)
+	}
+
+	reply23 := []byte{0xd2, 0x02, 0x80, 0x00, 0x01, 0x02, 0x01, 0x17, 0x00}
+	if v, ok := ParseServerReplyVersion(reply23); !ok || v != "2.1.23" {
+		t.Fatalf("ParseServerReplyVersion(reply23) = %q, %v; want 2.1.23, true", v, ok)
+	}
+
+	reply24 := []byte{0xd2, 0x04, 0x80, 0x00, 0x01, 0x02, 0x01, 0x18, 0x00}
+	if v, ok := ParseServerReplyVersion(reply24); !ok || v != "2.1.24" {
+		t.Fatalf("ParseServerReplyVersion(reply24) = %q, %v; want 2.1.24, true", v, ok)
+	}
+
+	if cmp := CompareVersions("2.1.24", "2.1.23"); cmp != 1 {
+		t.Errorf("CompareVersions(2.1.24, 2.1.23) = %d, want 1", cmp)
+	}
+	if cmp := CompareVersions("2.1.23", "2.1.24"); cmp != -1 {
+		t.Errorf("CompareVersions(2.1.23, 2.1.24) = %d, want -1", cmp)
+	}
+	if cmp := CompareVersions("2.1.24", "2.1.24"); cmp != 0 {
+		t.Errorf("CompareVersions(2.1.24, 2.1.24) = %d, want 0", cmp)
+	}
+}

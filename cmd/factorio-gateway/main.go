@@ -60,6 +60,110 @@ type ActorSuspender interface {
 	SuspendActor(ctx context.Context, atespace, name string) error
 }
 
+// TemplateSnapshotInfo describes the current state of an ActorTemplate in
+// Agent Substrate.
+type TemplateSnapshotInfo struct {
+	UID         string `json:"uid"`
+	ImageRef    string `json:"image_ref"`
+	SnapshotURI string `json:"snapshot_uri"`
+}
+
+// TemplateManager is an optional extension implemented by ActorSuspender that
+// queries and replaces the Factorio ActorTemplate in-place when a new
+// factoriotools/factorio:stable image digest is published.
+type TemplateManager interface {
+	GetTemplateInfo(ctx context.Context, atespace, templateName string) (TemplateSnapshotInfo, error)
+	UpgradeTemplateImage(ctx context.Context, atespace, templateName, newImageRef string) (TemplateSnapshotInfo, error)
+}
+
+// UpstreamRelease represents a resolved container image release from Docker Hub.
+type UpstreamRelease struct {
+	ImageRef string `json:"image_ref"`
+	Digest   string `json:"digest"`
+	Version  string `json:"version"`
+}
+
+// RegistryClient resolves the latest container image digest and Factorio
+// version tag (e.g. "2.1.24") from an upstream container registry.
+type RegistryClient interface {
+	ResolveLatestRelease(ctx context.Context, repo, tag string) (UpstreamRelease, error)
+}
+
+type dockerHubRegistryClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func newDockerHubRegistryClient(baseURL string) RegistryClient {
+	if baseURL == "" {
+		baseURL = "https://hub.docker.com"
+	}
+	return &dockerHubRegistryClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
+
+func (c *dockerHubRegistryClient) ResolveLatestRelease(ctx context.Context, repo, tag string) (UpstreamRelease, error) {
+	if repo == "" {
+		repo = "factoriotools/factorio"
+	}
+	if tag == "" {
+		tag = "stable"
+	}
+	u := fmt.Sprintf("%s/v2/repositories/%s/tags?page_size=25", c.baseURL, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return UpstreamRelease{}, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return UpstreamRelease{}, fmt.Errorf("query Docker Hub tags %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return UpstreamRelease{}, fmt.Errorf("Docker Hub status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Results []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return UpstreamRelease{}, fmt.Errorf("decode Docker Hub tags response: %w", err)
+	}
+
+	var targetDigest string
+	for _, r := range payload.Results {
+		if r.Name == tag && r.Digest != "" {
+			targetDigest = r.Digest
+			break
+		}
+	}
+	if targetDigest == "" {
+		return UpstreamRelease{}, fmt.Errorf("tag %q not found in %s", tag, repo)
+	}
+
+	var version string
+	for _, r := range payload.Results {
+		if r.Digest == targetDigest && r.Name != tag && strings.Count(r.Name, ".") == 2 {
+			version = r.Name
+			break
+		}
+	}
+
+	return UpstreamRelease{
+		ImageRef: fmt.Sprintf("index.docker.io/%s@%s", repo, targetDigest),
+		Digest:   targetDigest,
+		Version:  version,
+	}, nil
+}
+
 type grpcActorSuspender struct {
 	client ateapipb.ControlClient
 }
@@ -72,6 +176,108 @@ func (g *grpcActorSuspender) SuspendActor(ctx context.Context, atespace, name st
 		},
 	})
 	return err
+}
+
+func (g *grpcActorSuspender) GetTemplateInfo(ctx context.Context, atespace, templateName string) (TemplateSnapshotInfo, error) {
+	tmpl, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
+		ActorTemplate: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     templateName,
+		},
+	})
+	if err != nil {
+		return TemplateSnapshotInfo{}, err
+	}
+	return extractTemplateInfo(tmpl), nil
+}
+
+func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace, templateName, newImageRef string) (TemplateSnapshotInfo, error) {
+	tmpl, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
+		ActorTemplate: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     templateName,
+		},
+	})
+	if err != nil {
+		return TemplateSnapshotInfo{}, fmt.Errorf("get ActorTemplate %s/%s: %w", atespace, templateName, err)
+	}
+
+	updated := false
+	for _, c := range tmpl.GetContainers() {
+		if c.GetName() == "factorio" {
+			c.Image = newImageRef
+			updated = true
+		}
+	}
+	if !updated {
+		return TemplateSnapshotInfo{}, fmt.Errorf("container 'factorio' not found in ActorTemplate %s/%s", atespace, templateName)
+	}
+
+	if _, err := g.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{
+		ActorTemplate: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     templateName,
+		},
+	}); err != nil {
+		return TemplateSnapshotInfo{}, fmt.Errorf("delete old ActorTemplate %s/%s: %w", atespace, templateName, err)
+	}
+
+	if tmpl.Metadata != nil {
+		tmpl.Metadata.Uid = ""
+		tmpl.Metadata.Version = 0
+		tmpl.Metadata.CreateTime = nil
+		tmpl.Metadata.UpdateTime = nil
+	}
+	tmpl.Status = nil
+
+	created, err := g.client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+		ActorTemplate: tmpl,
+	})
+	if err != nil {
+		return TemplateSnapshotInfo{}, fmt.Errorf("recreate ActorTemplate %s/%s with image %s: %w", atespace, templateName, newImageRef, err)
+	}
+
+	// Wait for the new Golden Snapshot to finish building so Actors can resume immediately.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return extractTemplateInfo(created), fmt.Errorf("waiting for Golden Snapshot on %s/%s: %w", atespace, templateName, ctx.Err())
+		case <-ticker.C:
+			cur, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
+				ActorTemplate: &ateapipb.ObjectRef{
+					Atespace: atespace,
+					Name:     templateName,
+				},
+			})
+			if err != nil {
+				continue
+			}
+			gs := cur.GetStatus().GetGoldenSnapshotStatus()
+			if errMsg := gs.GetErrorMessage(); errMsg != "" {
+				return extractTemplateInfo(cur), fmt.Errorf("Golden Snapshot failed for %s/%s: %s", atespace, templateName, errMsg)
+			}
+			if uri := gs.GetGoldenSnapshot().GetSnapshotUri(); uri != "" {
+				return extractTemplateInfo(cur), nil
+			}
+		}
+	}
+}
+
+func extractTemplateInfo(tmpl *ateapipb.ActorTemplate) TemplateSnapshotInfo {
+	var img string
+	for _, c := range tmpl.GetContainers() {
+		if c.GetName() == "factorio" {
+			img = c.GetImage()
+			break
+		}
+	}
+	return TemplateSnapshotInfo{
+		UID:         tmpl.GetMetadata().GetUid(),
+		ImageRef:    img,
+		SnapshotURI: tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenSnapshot().GetSnapshotUri(),
+	}
 }
 
 func newGRPCActorSuspender(address, caFile, clientCertBundle, serverName string) (ActorSuspender, func(), error) {
@@ -135,6 +341,14 @@ type GatewayConfig struct {
 	PreemptIdleGrace   time.Duration
 	MaxActiveWorlds    int
 	RequireFactorioPkt bool
+
+	// Automatic ActorTemplate upgrade settings (proactive + reactive).
+	TemplateAtespace  string
+	TemplateName      string
+	UpstreamRepo      string
+	UpstreamTag       string
+	ImagePollInterval time.Duration
+	Registry          RegistryClient
 }
 
 type WorldTunnel struct {
@@ -153,6 +367,8 @@ type WorldTunnel struct {
 	lastOutboundReply time.Time
 	lastStateChange   time.Time
 	lastResumeLatency time.Duration
+	lastClientVersion string
+	lastServerVersion string
 
 	packetsRx      atomic.Uint64
 	packetsTx      atomic.Uint64
@@ -164,9 +380,23 @@ type WorldTunnel struct {
 type Gateway struct {
 	cfg       GatewayConfig
 	suspender ActorSuspender
+	tmplMgr   TemplateManager
+	registry  RegistryClient
 	worlds    map[string]*WorldTunnel // keyed by ActorRef ("atespace/actor")
 	byPort    map[int]*WorldTunnel
 	preemptMu sync.Mutex
+	upgradeMu sync.Mutex
+
+	metaMu             sync.Mutex
+	templateInfo       TemplateSnapshotInfo
+	upstreamRelease    UpstreamRelease
+	knownServerVersion string
+	lastClientVersion  string
+	lastUpdateCheck    time.Time
+	lastUpgradeTime    time.Time
+	lastUpgradeReason  string
+	lastUpdateError    string
+	upgradeCount       atomic.Uint64
 }
 
 func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
@@ -182,9 +412,31 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 	if cfg.MaxActiveWorlds <= 0 {
 		cfg.MaxActiveWorlds = 1
 	}
+	if cfg.TemplateAtespace == "" {
+		cfg.TemplateAtespace = "factorio"
+	}
+	if cfg.TemplateName == "" {
+		cfg.TemplateName = "factorio-server"
+	}
+	if cfg.UpstreamRepo == "" {
+		cfg.UpstreamRepo = "factoriotools/factorio"
+	}
+	if cfg.UpstreamTag == "" {
+		cfg.UpstreamTag = "stable"
+	}
+	var tmplMgr TemplateManager
+	if tm, ok := suspender.(TemplateManager); ok {
+		tmplMgr = tm
+	}
+	reg := cfg.Registry
+	if reg == nil && tmplMgr != nil {
+		reg = newDockerHubRegistryClient("")
+	}
 	gw := &Gateway{
 		cfg:       cfg,
 		suspender: suspender,
+		tmplMgr:   tmplMgr,
+		registry:  reg,
 		worlds:    make(map[string]*WorldTunnel, len(cfg.Routes)),
 		byPort:    make(map[int]*WorldTunnel, len(cfg.Routes)),
 	}
@@ -223,6 +475,12 @@ func (gw *Gateway) Start(ctx context.Context) error {
 		go wt.udpReadLoop(ctx)
 	}
 	go gw.idleReaperLoop(ctx)
+	if gw.tmplMgr != nil && gw.registry != nil {
+		go gw.syncTemplateMetadata(ctx)
+		if gw.cfg.ImagePollInterval > 0 {
+			go gw.imageUpdateLoop(ctx)
+		}
+	}
 	return nil
 }
 
@@ -264,9 +522,14 @@ func (wt *WorldTunnel) udpReadLoop(ctx context.Context) {
 func (wt *WorldTunnel) handleInboundUDP(ctx context.Context, raddr *net.UDPAddr, pkt []byte) {
 	clientKey := raddr.String()
 	now := time.Now()
+	clientVer, hasClientVer := tunnelproto.ParseClientVersion(pkt)
 
 	wt.mu.Lock()
 	wt.clientAddrs[clientKey] = raddr
+	if hasClientVer {
+		wt.lastClientVersion = clientVer
+		wt.gw.recordClientVersion(clientVer)
+	}
 	state := wt.state
 
 	if state == WorldStateSuspended || state == WorldStateSuspending {
@@ -285,6 +548,7 @@ func (wt *WorldTunnel) handleInboundUDP(ctx context.Context, raddr *net.UDPAddr,
 			slog.Info("UDP traffic waking Factorio Actor",
 				"actor", wt.spec.ActorRef(),
 				"client", clientKey,
+				"client_version", clientVer,
 				"port", wt.spec.UDPPort,
 			)
 			go wt.activateWorld(ctx)
@@ -319,6 +583,13 @@ func (wt *WorldTunnel) handleInboundUDP(ctx context.Context, raddr *net.UDPAddr,
 		wt.pendingByClient[clientKey] = pkt
 		wt.mu.Unlock()
 	}
+
+	// Reactive client version check while world is already RUNNING: if a newly
+	// updated Steam client connects with a newer version than the running server,
+	// trigger a background check/upgrade when the world is idle.
+	if hasClientVer && wt.gw.isClientNewerThanServer(clientVer) {
+		go wt.gw.handleReactiveVersionMismatch(ctx, wt, clientVer)
+	}
 }
 
 // shouldWakeLocked determines whether an inbound UDP packet to a SUSPENDED
@@ -349,6 +620,12 @@ func (wt *WorldTunnel) activateWorld(ctx context.Context) {
 	// running or resuming without active player traffic, suspend it first so
 	// this world can claim the worker pod.
 	wt.gw.preemptIdleWorldsFor(ctx, wt)
+
+	// Reactive auto-upgrade before wake: if the waking client packet advertised a
+	// newer Factorio version than the current ActorTemplate (e.g. Steam auto-updated
+	// the client before the 30m background poll fired), check Docker Hub and
+	// upgrade the ActorTemplate before dialing atenet-router!
+	wt.gw.maybeUpgradeBeforeWake(ctx, wt)
 
 	tunnelCtx, cancel := context.WithCancel(ctx)
 	wt.mu.Lock()
@@ -524,12 +801,24 @@ func (wt *WorldTunnel) wsReadLoop(ctx context.Context, ws *websocket.Conn) {
 		if err != nil {
 			continue
 		}
+		srvVer, hasSrvVer := tunnelproto.ParseServerReplyVersion(payload)
 
 		wt.mu.Lock()
 		raddr := wt.clientAddrs[clientKey]
 		// Reset the 10-minute idle timer ONLY when Factorio sends a reply packet!
 		wt.lastOutboundReply = time.Now()
+		if hasSrvVer {
+			wt.lastServerVersion = srvVer
+		}
+		clientVer := wt.lastClientVersion
 		wt.mu.Unlock()
+
+		if hasSrvVer {
+			wt.gw.recordServerVersion(srvVer)
+			if clientVer != "" && tunnelproto.CompareVersions(clientVer, srvVer) > 0 {
+				go wt.gw.handleReactiveVersionMismatch(ctx, wt, clientVer)
+			}
+		}
 
 		if raddr == nil {
 			parsed, err := net.ResolveUDPAddr("udp4", clientKey)
@@ -542,6 +831,247 @@ func (wt *WorldTunnel) wsReadLoop(ctx context.Context, ws *websocket.Conn) {
 			wt.packetsTx.Add(1)
 		}
 	}
+}
+
+func (gw *Gateway) recordClientVersion(v string) {
+	gw.metaMu.Lock()
+	gw.lastClientVersion = v
+	gw.metaMu.Unlock()
+}
+
+func (gw *Gateway) recordServerVersion(v string) {
+	gw.metaMu.Lock()
+	gw.knownServerVersion = v
+	gw.metaMu.Unlock()
+}
+
+func (gw *Gateway) isClientNewerThanServer(clientVer string) bool {
+	if clientVer == "" {
+		return false
+	}
+	gw.metaMu.Lock()
+	srvVer := gw.knownServerVersion
+	gw.metaMu.Unlock()
+	if srvVer == "" {
+		return false
+	}
+	return tunnelproto.CompareVersions(clientVer, srvVer) > 0
+}
+
+func (gw *Gateway) syncTemplateMetadata(ctx context.Context) {
+	if gw.tmplMgr == nil {
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	info, err := gw.tmplMgr.GetTemplateInfo(syncCtx, gw.cfg.TemplateAtespace, gw.cfg.TemplateName)
+	if err == nil {
+		gw.metaMu.Lock()
+		gw.templateInfo = info
+		gw.metaMu.Unlock()
+	}
+	if gw.registry != nil {
+		rel, err := gw.registry.ResolveLatestRelease(syncCtx, gw.cfg.UpstreamRepo, gw.cfg.UpstreamTag)
+		if err == nil {
+			gw.metaMu.Lock()
+			gw.upstreamRelease = rel
+			gw.lastUpdateCheck = time.Now()
+			if gw.knownServerVersion == "" && rel.Digest != "" && strings.Contains(info.ImageRef, rel.Digest) {
+				gw.knownServerVersion = rel.Version
+			}
+			gw.metaMu.Unlock()
+		}
+	}
+}
+
+func (gw *Gateway) imageUpdateLoop(ctx context.Context) {
+	ticker := time.NewTicker(gw.cfg.ImagePollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if gw.allWorldsSuspended(nil) {
+				_, _ = gw.CheckAndUpgradeTemplate(ctx, "proactive-background-poll", nil)
+			}
+		}
+	}
+}
+
+func (gw *Gateway) allWorldsSuspended(ignore *WorldTunnel) bool {
+	for _, wt := range gw.worlds {
+		if wt == ignore {
+			continue
+		}
+		wt.mu.Lock()
+		st := wt.state
+		wt.mu.Unlock()
+		if st != WorldStateSuspended {
+			return false
+		}
+	}
+	return true
+}
+
+func (gw *Gateway) maybeUpgradeBeforeWake(ctx context.Context, wakingWorld *WorldTunnel) {
+	if gw.tmplMgr == nil || gw.registry == nil {
+		return
+	}
+	wakingWorld.mu.Lock()
+	clientVer := wakingWorld.lastClientVersion
+	wakingWorld.mu.Unlock()
+	if clientVer == "" {
+		return
+	}
+
+	gw.metaMu.Lock()
+	srvVer := gw.knownServerVersion
+	gw.metaMu.Unlock()
+
+	// If knownServerVersion isn't known yet or clientVer is newer, check upstream before waking.
+	if srvVer == "" || tunnelproto.CompareVersions(clientVer, srvVer) > 0 {
+		slog.Info("Client version triggers pre-wake Docker Hub check",
+			"actor", wakingWorld.spec.ActorRef(),
+			"client_version", clientVer,
+			"known_server_version", srvVer,
+		)
+		_, _ = gw.CheckAndUpgradeTemplate(ctx, "reactive-client-version:"+clientVer, wakingWorld)
+	}
+}
+
+func (gw *Gateway) handleReactiveVersionMismatch(ctx context.Context, wt *WorldTunnel, clientVer string) {
+	if gw.tmplMgr == nil || gw.registry == nil {
+		return
+	}
+	if !gw.isClientNewerThanServer(clientVer) {
+		return
+	}
+	slog.Info("Detected newer Factorio client version against running world; checking upstream for auto-upgrade",
+		"actor", wt.spec.ActorRef(),
+		"client_version", clientVer,
+	)
+	_ = wt.suspendNow(ctx, "client-version-upgrade-"+clientVer)
+	_, _ = gw.CheckAndUpgradeTemplate(ctx, "reactive-client-version:"+clientVer, nil)
+}
+
+// CheckAndUpgradeTemplate queries the upstream registry and current
+// ActorTemplate, and if the upstream digest has changed while worlds are
+// suspended, replaces the ActorTemplate in-place and waits for the new Golden
+// Snapshot. Existing Actors retain their /factorio saves and automatically
+// migrate via Agent Substrate's SNAPSHOT_SCOPE_DATA on next resume.
+func (gw *Gateway) CheckAndUpgradeTemplate(ctx context.Context, reason string, ignoreWorld *WorldTunnel) (map[string]any, error) {
+	if gw.tmplMgr == nil || gw.registry == nil {
+		return map[string]any{"status": "disabled"}, nil
+	}
+
+	gw.upgradeMu.Lock()
+	defer gw.upgradeMu.Unlock()
+
+	checkCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+
+	tmplInfo, err := gw.tmplMgr.GetTemplateInfo(checkCtx, gw.cfg.TemplateAtespace, gw.cfg.TemplateName)
+	if err != nil {
+		gw.metaMu.Lock()
+		gw.lastUpdateError = err.Error()
+		gw.metaMu.Unlock()
+		return nil, fmt.Errorf("get template info: %w", err)
+	}
+
+	upstream, err := gw.registry.ResolveLatestRelease(checkCtx, gw.cfg.UpstreamRepo, gw.cfg.UpstreamTag)
+	if err != nil {
+		gw.metaMu.Lock()
+		gw.lastUpdateError = err.Error()
+		gw.metaMu.Unlock()
+		return nil, fmt.Errorf("resolve upstream release: %w", err)
+	}
+
+	now := time.Now()
+	gw.metaMu.Lock()
+	gw.templateInfo = tmplInfo
+	gw.upstreamRelease = upstream
+	gw.lastUpdateCheck = now
+	gw.lastUpdateError = ""
+	if gw.knownServerVersion == "" && upstream.Digest != "" && strings.Contains(tmplInfo.ImageRef, upstream.Digest) {
+		gw.knownServerVersion = upstream.Version
+	}
+	gw.metaMu.Unlock()
+
+	needsUpgrade := upstream.Digest != "" && !strings.Contains(tmplInfo.ImageRef, upstream.Digest)
+	if !needsUpgrade {
+		return map[string]any{
+			"upgraded":         false,
+			"reason":           reason,
+			"template_uid":     tmplInfo.UID,
+			"template_image":   tmplInfo.ImageRef,
+			"upstream_image":   upstream.ImageRef,
+			"upstream_digest":  upstream.Digest,
+			"upstream_version": upstream.Version,
+		}, nil
+	}
+
+	if !gw.allWorldsSuspended(ignoreWorld) {
+		msg := "upstream update available; deferring until all worlds are SUSPENDED"
+		slog.Info(msg, "current_image", tmplInfo.ImageRef, "upstream_image", upstream.ImageRef, "upstream_version", upstream.Version)
+		return map[string]any{
+			"upgraded":         false,
+			"deferred":         true,
+			"message":          msg,
+			"template_image":   tmplInfo.ImageRef,
+			"upstream_image":   upstream.ImageRef,
+			"upstream_version": upstream.Version,
+		}, nil
+	}
+
+	slog.Info("Upgrading Factorio ActorTemplate in-place to new upstream release",
+		"atespace", gw.cfg.TemplateAtespace,
+		"template", gw.cfg.TemplateName,
+		"old_uid", tmplInfo.UID,
+		"old_image", tmplInfo.ImageRef,
+		"new_image", upstream.ImageRef,
+		"new_version", upstream.Version,
+		"reason", reason,
+	)
+
+	newInfo, err := gw.tmplMgr.UpgradeTemplateImage(checkCtx, gw.cfg.TemplateAtespace, gw.cfg.TemplateName, upstream.ImageRef)
+	if err != nil {
+		gw.metaMu.Lock()
+		gw.lastUpdateError = err.Error()
+		gw.metaMu.Unlock()
+		slog.Error("ActorTemplate auto-upgrade failed", "err", err)
+		return nil, err
+	}
+
+	gw.upgradeCount.Add(1)
+	gw.metaMu.Lock()
+	gw.templateInfo = newInfo
+	if upstream.Version != "" {
+		gw.knownServerVersion = upstream.Version
+	}
+	gw.lastUpgradeTime = time.Now()
+	gw.lastUpgradeReason = reason
+	gw.metaMu.Unlock()
+
+	slog.Info("Factorio ActorTemplate Golden Snapshot ready on new release; Actors will auto-migrate via SNAPSHOT_SCOPE_DATA on next wake",
+		"new_uid", newInfo.UID,
+		"new_image", newInfo.ImageRef,
+		"new_version", upstream.Version,
+		"snapshot_uri", newInfo.SnapshotURI,
+	)
+
+	return map[string]any{
+		"upgraded":         true,
+		"reason":           reason,
+		"old_template_uid": tmplInfo.UID,
+		"new_template_uid": newInfo.UID,
+		"old_image":        tmplInfo.ImageRef,
+		"new_image":        newInfo.ImageRef,
+		"upstream_version": upstream.Version,
+		"snapshot_uri":     newInfo.SnapshotURI,
+	}, nil
 }
 
 func (gw *Gateway) idleReaperLoop(ctx context.Context) {
@@ -657,7 +1187,22 @@ func (gw *Gateway) HTTPHandler() http.Handler {
 	mux.HandleFunc("/status", gw.handleStatus)
 	mux.HandleFunc("/world-status", gw.handleWorldStatus)
 	mux.HandleFunc("/suspend", gw.handleManualSuspend)
+	mux.HandleFunc("/check-update", gw.handleCheckUpdate)
 	return mux
+}
+
+func (gw *Gateway) handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	res, err := gw.CheckAndUpgradeTemplate(r.Context(), "manual-http-trigger", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -671,6 +1216,8 @@ func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		lastChange := wt.lastStateChange
 		resumeMs := wt.lastResumeLatency.Milliseconds()
 		clients := len(wt.clientAddrs)
+		clientVer := wt.lastClientVersion
+		srvVer := wt.lastServerVersion
 		wt.mu.Unlock()
 
 		var idleSec float64
@@ -693,6 +1240,8 @@ func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"actor":                  r.ActorRef(),
 			"state":                  st,
 			"known_clients":          clients,
+			"last_client_version":    clientVer,
+			"last_server_version":    srvVer,
 			"packets_rx":             wt.packetsRx.Load(),
 			"packets_tx":             wt.packetsTx.Load(),
 			"scanner_dropped":        wt.scannerDropped.Load(),
@@ -703,10 +1252,46 @@ func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"idle_remaining_seconds": int(remainingSec),
 		})
 	}
+
+	gw.metaMu.Lock()
+	tmplInfo := gw.templateInfo
+	upstream := gw.upstreamRelease
+	knownSrvVer := gw.knownServerVersion
+	lastCliVer := gw.lastClientVersion
+	lastCheck := gw.lastUpdateCheck
+	lastUpgrade := gw.lastUpgradeTime
+	lastReason := gw.lastUpgradeReason
+	lastErr := gw.lastUpdateError
+	gw.metaMu.Unlock()
+
+	autoUpdate := map[string]any{
+		"poll_interval":        gw.cfg.ImagePollInterval.String(),
+		"template_atespace":    gw.cfg.TemplateAtespace,
+		"template_name":        gw.cfg.TemplateName,
+		"template_uid":         tmplInfo.UID,
+		"template_image":       tmplInfo.ImageRef,
+		"upstream_repo":        gw.cfg.UpstreamRepo,
+		"upstream_tag":         gw.cfg.UpstreamTag,
+		"upstream_digest":      upstream.Digest,
+		"upstream_version":     upstream.Version,
+		"known_server_version": knownSrvVer,
+		"last_client_version":  lastCliVer,
+		"upgrade_count":        gw.upgradeCount.Load(),
+		"last_upgrade_reason":  lastReason,
+		"last_update_error":    lastErr,
+	}
+	if !lastCheck.IsZero() {
+		autoUpdate["last_update_check"] = lastCheck.UTC().Format(time.RFC3339)
+	}
+	if !lastUpgrade.IsZero() {
+		autoUpdate["last_upgrade_time"] = lastUpgrade.UTC().Format(time.RFC3339)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"idle_timeout":      gw.cfg.IdleTimeout.String(),
 		"max_active_worlds": gw.cfg.MaxActiveWorlds,
+		"auto_update":       autoUpdate,
 		"worlds":            worlds,
 	})
 }
@@ -790,18 +1375,23 @@ func parseRoutes(raw string) ([]RouteSpec, error) {
 
 func main() {
 	var (
-		routesRaw        string
-		udpBindIP        string
-		httpListenAddr   string
-		routerHTTPAddr   string
-		idleTimeout      time.Duration
-		wsRotateInterval time.Duration
-		preemptIdleGrace time.Duration
-		maxActiveWorlds  int
-		ateapiAddr       string
-		ateapiCAFile     string
-		ateapiClientCert string
-		ateapiServerName string
+		routesRaw         string
+		udpBindIP         string
+		httpListenAddr    string
+		routerHTTPAddr    string
+		idleTimeout       time.Duration
+		wsRotateInterval  time.Duration
+		preemptIdleGrace  time.Duration
+		maxActiveWorlds   int
+		templateAtespace  string
+		templateName      string
+		upstreamRepo      string
+		upstreamTag       string
+		imagePollInterval time.Duration
+		ateapiAddr        string
+		ateapiCAFile      string
+		ateapiClientCert  string
+		ateapiServerName  string
 	)
 	flag.StringVar(&routesRaw, "routes", "34197=factorio/world-vanilla,34198=factorio/world-deathworld", "Comma-separated <udpPort>=<atespace>/<actor> routes")
 	flag.StringVar(&udpBindIP, "udp-bind-ip", "0.0.0.0", "IP address to bind UDP listeners on")
@@ -811,6 +1401,11 @@ func main() {
 	flag.DurationVar(&wsRotateInterval, "ws-rotate-interval", 4*time.Minute, "WebSocket rotation interval (must be < Envoy 5m route-timeout)")
 	flag.DurationVar(&preemptIdleGrace, "preempt-idle-grace", 5*time.Second, "Minimum idle time before a world can be preempted when multiplexing a full WorkerPool")
 	flag.IntVar(&maxActiveWorlds, "max-active-worlds", 1, "Maximum concurrent running worlds (matches WorkerPool replicas)")
+	flag.StringVar(&templateAtespace, "template-atespace", "factorio", "Atespace of the Factorio ActorTemplate to auto-upgrade")
+	flag.StringVar(&templateName, "template-name", "factorio-server", "Name of the Factorio ActorTemplate to auto-upgrade")
+	flag.StringVar(&upstreamRepo, "upstream-repo", "factoriotools/factorio", "Docker Hub repository to watch for new Factorio server releases")
+	flag.StringVar(&upstreamTag, "upstream-tag", "stable", "Docker Hub tag to track for automatic Factorio ActorTemplate upgrades")
+	flag.DurationVar(&imagePollInterval, "image-poll-interval", 30*time.Minute, "Background poll interval for checking Docker Hub when worlds are SUSPENDED (0 to disable)")
 	flag.StringVar(&ateapiAddr, "ateapi-address", "api.ate-system.svc.cluster.local:443", "Substrate Control Plane gRPC address")
 	flag.StringVar(&ateapiCAFile, "ateapi-ca-file", "/run/servicedns-ca/trust-bundle.pem", "CA bundle for verifying ate-api-server")
 	flag.StringVar(&ateapiClientCert, "ateapi-client-cert", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "Pod Identity client cert bundle for mTLS to ate-api-server")
@@ -840,6 +1435,11 @@ func main() {
 		PreemptIdleGrace:   preemptIdleGrace,
 		MaxActiveWorlds:    maxActiveWorlds,
 		RequireFactorioPkt: false,
+		TemplateAtespace:   templateAtespace,
+		TemplateName:       templateName,
+		UpstreamRepo:       upstreamRepo,
+		UpstreamTag:        upstreamTag,
+		ImagePollInterval:  imagePollInterval,
 	}, suspender)
 
 	ctx, cancel := context.WithCancel(context.Background())

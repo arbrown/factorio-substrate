@@ -17,6 +17,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,8 +32,10 @@ import (
 )
 
 type fakeSuspender struct {
-	mu        sync.Mutex
-	suspended []string
+	mu           sync.Mutex
+	suspended    []string
+	tmplInfo     TemplateSnapshotInfo
+	upgradeCalls []string
 }
 
 func (f *fakeSuspender) SuspendActor(_ context.Context, atespace, name string) error {
@@ -41,10 +45,55 @@ func (f *fakeSuspender) SuspendActor(_ context.Context, atespace, name string) e
 	return nil
 }
 
+func (f *fakeSuspender) GetTemplateInfo(_ context.Context, _, _ string) (TemplateSnapshotInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tmplInfo, nil
+}
+
+func (f *fakeSuspender) UpgradeTemplateImage(_ context.Context, _, _, newImageRef string) (TemplateSnapshotInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upgradeCalls = append(f.upgradeCalls, newImageRef)
+	f.tmplInfo = TemplateSnapshotInfo{
+		UID:         fmt.Sprintf("uid-%d", len(f.upgradeCalls)+1),
+		ImageRef:    newImageRef,
+		SnapshotURI: fmt.Sprintf("gs://bucket/golden-%d", len(f.upgradeCalls)+1),
+	}
+	return f.tmplInfo, nil
+}
+
 func (f *fakeSuspender) list() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.suspended...)
+}
+
+func (f *fakeSuspender) upgrades() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.upgradeCalls...)
+}
+
+type fakeRegistry struct {
+	mu      sync.Mutex
+	release UpstreamRelease
+}
+
+func (r *fakeRegistry) set(version, digest string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.release = UpstreamRelease{
+		ImageRef: "index.docker.io/factoriotools/factorio@" + digest,
+		Digest:   digest,
+		Version:  version,
+	}
+}
+
+func (r *fakeRegistry) ResolveLatestRelease(_ context.Context, _, _ string) (UpstreamRelease, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.release, nil
 }
 
 func TestGatewayWakeMultiplexAndIdleSuspend(t *testing.T) {
@@ -166,4 +215,127 @@ func TestGatewayWakeMultiplexAndIdleSuspend(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("expected world-deathworld to auto-suspend after idle timeout, got %v", suspender.list())
+}
+
+func TestGatewayProactiveAndReactiveAutoUpgrade(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+	routerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/prepare-suspend" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"save_output":"Saved"}`))
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			mt, frame, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			clientAddr, payload, err := tunnelproto.DecodeFrame(frame)
+			if err != nil {
+				continue
+			}
+			replyFrame, _ := tunnelproto.EncodeFrame(clientAddr, payload)
+			_ = ws.WriteMessage(mt, replyFrame)
+		}
+	}))
+	defer routerSrv.Close()
+
+	routerHost := strings.TrimPrefix(routerSrv.URL, "http://")
+	suspender := &fakeSuspender{
+		tmplInfo: TemplateSnapshotInfo{
+			UID:         "uid-1",
+			ImageRef:    "index.docker.io/factoriotools/factorio@sha256:old2123",
+			SnapshotURI: "gs://bucket/golden-1",
+		},
+	}
+	reg := &fakeRegistry{}
+	reg.set("2.1.23", "sha256:old2123")
+
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:         "127.0.0.1",
+		RouterHTTPAddr:    routerHost,
+		IdleTimeout:       10 * time.Second,
+		WSRotateInterval:  10 * time.Second,
+		PreemptIdleGrace:  50 * time.Millisecond,
+		MaxActiveWorlds:   1,
+		ImagePollInterval: 100 * time.Millisecond,
+		Registry:          reg,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := gw.Start(ctx); err != nil {
+		t.Fatalf("gw.Start failed: %v", err)
+	}
+	defer gw.Close()
+
+	// 1. Proactive background watcher: advance upstream registry to 2.1.24 (sha256:new2124)
+	// while world-vanilla is SUSPENDED, and verify the background poll upgrades ActorTemplate.
+	reg.set("2.1.24", "sha256:new2124")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ups := suspender.upgrades(); len(ups) >= 1 {
+			if ups[0] != "index.docker.io/factoriotools/factorio@sha256:new2124" {
+				t.Fatalf("unexpected proactive upgrade image: %q", ups[0])
+			}
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if len(suspender.upgrades()) < 1 {
+		t.Fatalf("expected proactive background poll to upgrade ActorTemplate to 2.1.24")
+	}
+
+	// 2. Reactive client version sniffer: pause background polling by setting a long interval,
+	// advance upstream registry to 2.1.25 (sha256:new2125), and send a UDP ConnectionRequest
+	// advertising client version 2.1.25. Verify the gateway upgrades ActorTemplate BEFORE waking!
+	gw.cfg.ImagePollInterval = 1 * time.Hour
+	reg.set("2.1.25", "sha256:new2125")
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	probe25 := tunnelproto.BuildFactorioProbePacketForVersion(777, 2, 1, 25)
+	_, _ = clientConn.WriteToUDP(probe25, vanillaWT.LocalUDPAddr().(*net.UDPAddr))
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	if _, _, err := clientConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("ReadFromUDP after reactive upgrade failed: %v", err)
+	}
+
+	ups := suspender.upgrades()
+	if len(ups) != 2 || ups[1] != "index.docker.io/factoriotools/factorio@sha256:new2125" {
+		t.Fatalf("expected reactive client version sniffer to upgrade ActorTemplate to 2.1.25, got %v", ups)
+	}
+
+	// Verify /status reports the auto_update metadata.
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(rec, req)
+	var statusPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &statusPayload); err != nil {
+		t.Fatalf("unmarshal /status failed: %v", err)
+	}
+	autoUpd, _ := statusPayload["auto_update"].(map[string]any)
+	if got := autoUpd["known_server_version"]; got != "2.1.25" {
+		t.Fatalf("expected known_server_version=2.1.25 in /status, got %v", got)
+	}
+	if got := autoUpd["last_client_version"]; got != "2.1.25" {
+		t.Fatalf("expected last_client_version=2.1.25 in /status, got %v", got)
+	}
 }
