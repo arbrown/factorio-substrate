@@ -359,10 +359,15 @@ func (s *SidecarServer) readLoopForClient(sess *clientSession) {
 }
 
 func (s *SidecarServer) handlePrepareSuspend(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
 	saveOut, err := rcon.Execute(ctx, s.cfg.FactorioRCONAddr, s.cfg.RCONPassword, "/server-save")
+	if err == nil {
+		// Execute a follow-up RCON round-trip after /server-save so we only return
+		// once Factorio's main thread has finished writing and renaming *.tmp.zip.
+		_, _ = rcon.Execute(ctx, s.cfg.FactorioRCONAddr, s.cfg.RCONPassword, "/version")
+	}
 	resp := map[string]any{
 		"actor":       s.readSystemInfo("actor-name"),
 		"atespace":    s.readSystemInfo("atespace"),
