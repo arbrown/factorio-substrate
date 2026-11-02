@@ -429,7 +429,7 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 		tmplMgr = tm
 	}
 	reg := cfg.Registry
-	if reg == nil && tmplMgr != nil {
+	if reg == nil && tmplMgr != nil && cfg.ImagePollInterval > 0 {
 		reg = newDockerHubRegistryClient("")
 	}
 	gw := &Gateway{
