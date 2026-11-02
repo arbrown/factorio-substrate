@@ -92,7 +92,7 @@ func DecodeFrame(frame []byte) (clientAddr string, payload []byte, err error) {
 func BuildFactorioProbePacket(requestID uint32) []byte {
 	pkt := []byte{
 		0x42,                   // Type 0x02 (ConnectionRequest) + reliability flags
-		0x02, 0x01, 0x17, 0x00, // Factorio 2.1.23.0 version header
+		0x02, 0x01, 0x18, 0x00, // Factorio 2.1.24.0 version header
 		0x56, 0x56, // Protocol magic / build marker
 		0x00, 0x00, 0x00, 0x00, // Client request ID (filled below)
 		0x55, 0x66, 0x77, 0x88,
