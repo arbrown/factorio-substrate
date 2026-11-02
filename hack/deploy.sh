@@ -67,12 +67,26 @@ if ! run_kubectl_ate get atespace factorio >/dev/null 2>&1; then
   run_kubectl_ate create atespace factorio
 fi
 
-echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready)..."
+echo "==> Resolving latest factoriotools/factorio:${FACTORIO_TAG:-stable} digest from Docker Hub..."
+FACTORIO_TAG="${FACTORIO_TAG:-stable}"
+FACTORIO_DIGEST="$(curl -fsSL "https://hub.docker.com/v2/repositories/factoriotools/factorio/tags/${FACTORIO_TAG}" 2>/dev/null | jq -r '.digest // empty' || true)"
+if [[ -z "${FACTORIO_DIGEST}" ]]; then
+  FACTORIO_DIGEST="sha256:0ef394757b906f8e2e42d7e1f05332ad7cf7575c40d9b2412fa4c477189bdea7"
+fi
+FACTORIO_IMAGE="${FACTORIO_IMAGE:-index.docker.io/factoriotools/factorio@${FACTORIO_DIGEST}}"
+echo "    FACTORIO_IMAGE=${FACTORIO_IMAGE}"
+
+echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready with ${FACTORIO_IMAGE})..."
 if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
-  SNAP_URI="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty')"
-  if [[ -z "${SNAP_URI}" ]]; then
-    OLD_UID="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.metadata.uid // empty')"
-    echo "    Existing factorio-server ActorTemplate (${OLD_UID}) is not Ready; recreating..."
+  TMPL_JSON="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json)"
+  SNAP_URI="$(echo "${TMPL_JSON}" | jq -r '.status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty')"
+  CUR_FACTORIO_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="factorio") | .image // empty')"
+  if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" ]]; then
+    OLD_UID="$(echo "${TMPL_JSON}" | jq -r '.metadata.uid // empty')"
+    echo "    Recreating factorio-server ActorTemplate (old image=${CUR_FACTORIO_IMAGE}, new image=${FACTORIO_IMAGE})..."
+    for ACTOR in world-vanilla world-deathworld; do
+      run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+    done
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
     if [[ -n "${OLD_UID}" ]]; then
       kubectl exec -n ate-system postgres-0 -c postgres -- psql -U postgres -d atepg -c "DELETE FROM worker_assignments; DELETE FROM workers; DELETE FROM actors WHERE name = '${OLD_UID}';" >/dev/null 2>&1 || true
@@ -84,6 +98,7 @@ if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&
 fi
 if ! run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
+      -e "s|\${FACTORIO_IMAGE}|${FACTORIO_IMAGE}|g" \
       manifests/factorio-template.yaml.tmpl \
     | run_ko resolve -f - \
     | run_kubectl_ate create actor-template -f -

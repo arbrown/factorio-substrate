@@ -41,7 +41,7 @@ containers:
   - name: system-info
     mountPath: /run/ate
 - name: factorio
-  image: "index.docker.io/factoriotools/factorio@sha256:74f41f9450f2ba8464c445fb712f5ca1643a6b92b495c7a1f301bb3f1c7e2940"
+  image: "${FACTORIO_IMAGE}"
   command:
   - /bin/bash
   - -ec
