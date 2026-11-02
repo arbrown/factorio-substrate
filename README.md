@@ -4,7 +4,7 @@ Running stateful, UDP-based dedicated game servers (`factoriotools/factorio:stab
 
 This repository is the companion implementation to the follow-up post on [Factorio on GKE with Spot VMs and Auto-Shutdown](https://wasd.drewbrown.me/posts/factorio-gke-spot/).
 
-See [`TRADEOFFS.md`](TRADEOFFS.md) for a detailed breakdown of the 7 architectural challenges ("holes poked") and how this implementation resolves them without modifying Agent Substrate.
+See [`TRADEOFFS.md`](TRADEOFFS.md) for a detailed breakdown of the 11 architectural challenges ("holes poked") and how this implementation resolves them without modifying Agent Substrate.
 
 ---
 
@@ -49,18 +49,26 @@ By default, we deploy:
 
 Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198` while `world-vanilla` is idle automatically triggers an RCON `/server-save` on `world-vanilla`, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores `world-deathworld` into the exact same worker pod!
 
+### Automatic Zero-Touch Factorio Version Upgrades (Proactive + Reactive)
+Because Steam auto-updates players' Factorio clients whenever Wube releases a new `stable` patch, `factorio-gateway` implements a **dual auto-upgrade system**:
+1. **Proactive Background Docker Hub Watcher (`--image-poll-interval=30m`):** Periodically polls Docker Hub (`factoriotools/factorio:stable`) while worlds are `SUSPENDED`. When the `@sha256:...` digest changes, `factorio-gateway` replaces the `factorio/factorio-server` `ActorTemplate` via mTLS gRPC (`GetActorTemplate` → `DeleteActorTemplate` → `CreateActorTemplate`) so the new Golden Snapshot is pre-built in the background.
+2. **Reactive Client Version Sniffer on UDP `ConnectionRequest`:** Parses the connecting player's 4-byte Factorio version (`major.minor.patch.0`, e.g. `2.1.24.0`) from the first UDP `ConnectionRequest` (`0x02`) packet. If a player's Steam client has updated to a newer version before the 30-minute background poll has fired, `factorio-gateway` immediately checks Docker Hub and upgrades `factorio/factorio-server` on the spot.
+3. **In-Place Save Migration via `SNAPSHOT_SCOPE_DATA`:** Existing `Actor`s (`world-vanilla`, `world-deathworld`) are **not** recreated. When an Actor wakes up after its `ActorTemplate` UID has changed, Agent Substrate's `TemplateReplaced` check (`workflow_resume.go`) automatically switches that single wake to `SNAPSHOT_SCOPE_DATA` (`RESUME_SOURCE_COLD_BOOT`), extracting only `/factorio/saves/_autosave1.zip` (`durable-dir.tar.zstd`) into the new Factorio container so Factorio migrates the save file in-place. All subsequent suspends and wakes return to fast (~1.5s) `SNAPSHOT_SCOPE_FULL` memory restores!
+
 ---
 
 ## Repository Layout
 
-- [`cmd/factorio-gateway/main.go`](cmd/factorio-gateway/main.go) — Always-on UDP-to-WebSocket ingress gateway, `ResumeActor`/`SuspendActor` lifecycle manager, single-worker multiplexer, and idle timer.
-- [`cmd/factorio-sidecar/main.go`](cmd/factorio-sidecar/main.go) — In-actor sidecar that seeds `/factorio/config`, bridges `/ws` frames to `127.0.0.1:34197/UDP`, probes Factorio readiness via UDP `ConnectionRequest`, and triggers RCON `/server-save` on `/prepare-suspend`.
-- [`cmd/factorio-probe/main.go`](cmd/factorio-probe/main.go) — CLI probe that sends real Factorio 2.x UDP `ConnectionRequest` packets (`0x42 0x02 0x01 0x17...`) to test wake-on-UDP and measure resume latency without needing a graphical Factorio client.
-- [`internal/tunnelproto/frame.go`](internal/tunnelproto/frame.go) — Wire framing (`[2B addrLen][addr][payload]`) and Factorio UDP header validation.
+- [`cmd/factorio-gateway/main.go`](cmd/factorio-gateway/main.go) — Always-on UDP-to-WebSocket ingress gateway, `ResumeActor`/`SuspendActor` lifecycle manager, single-worker multiplexer, idle timer, and proactive/reactive `ActorTemplate` auto-upgrader.
+- [`cmd/factorio-sidecar/main.go`](cmd/factorio-sidecar/main.go) — In-actor sidecar that bridges `/ws` frames to `127.0.0.1:34197/UDP`, probes Factorio readiness via UDP `ConnectionRequest`, and triggers RCON `/server-save` + `/version` barrier on `/prepare-suspend`.
+- [`cmd/factorio-probe/main.go`](cmd/factorio-probe/main.go) — CLI probe that sends real Factorio 2.x UDP `ConnectionRequest` packets (`0x42 0x02 0x01 0x18...`) to test wake-on-UDP and measure resume latency without needing a graphical Factorio client.
+- [`internal/tunnelproto/frame.go`](internal/tunnelproto/frame.go) — Wire framing (`[2B addrLen][addr][payload]`), Factorio UDP header validation, and client/server version extraction.
 - [`internal/rcon/rcon.go`](internal/rcon/rcon.go) — Minimal Source RCON TCP client for talking to Factorio on `127.0.0.1:27015`.
-- [`manifests/`](manifests/) — Kubernetes (`ATEnamespace`, `WorkerPool`, `Deployment`, `Service`) and Agent Substrate (`ActorTemplate`) manifest templates.
-- [`hack/deploy.sh`](hack/deploy.sh) — Builds images with `ko`, applies manifests, registers the `ActorTemplate`, and creates both Factorio `Actor` worlds (`world-vanilla` and `world-deathworld`).
+- [`manifests/`](manifests/) — Kubernetes (`Namespace`, `WorkerPool`, `Deployment`, `Service`) and Agent Substrate (`ActorTemplate`) manifest templates.
+- [`hack/deploy.sh`](hack/deploy.sh) — Builds images with `ko`, applies manifests, dynamically resolves the latest `factoriotools/factorio:stable` digest, registers `factorio-server`, and creates `world-vanilla` and `world-deathworld`.
 - [`hack/test-e2e.sh`](hack/test-e2e.sh) — Automated end-to-end verification script testing wake-on-UDP, RCON status, multi-world multiplexing on the single worker pod, and idle auto-suspend.
+- [`hack/prove-e2e.sh`](hack/prove-e2e.sh) — Full stateful proof that spawns a `steel-chest` with `42` `automation-science-pack`s at `(0.5, 0.5)` on `nauvis` via RCON Lua, multiplexes to `world-deathworld` (evicting `world-vanilla` to GCS), wakes `world-vanilla` back up from GCS, and verifies the chest and all 42 science packs survived.
+- [`hack/watch-actors.sh`](hack/watch-actors.sh) — Live terminal dashboard (`make watch`) and transition logger (`make watch-transitions`) showing Actor states, WorkerPool pod assignments, GCS snapshot URIs, and gateway UDP counters.
 - [`TRADEOFFS.md`](TRADEOFFS.md) — Explicit record of all architectural trade-offs and design decisions.
 
 ---
@@ -116,11 +124,20 @@ This will:
 4. Register the `factorio-server` `ActorTemplate` (`SNAPSHOT_CONTENT_SCOPE_FULL` + `/factorio` `durableDir`).
 5. Create `factorio/world-vanilla` and `factorio/world-deathworld` and suspend both into GCS so they start in `ACTOR_STATE_SUSPENDED` (zero idle compute used by Factorio).
 
-### 4. Verify End-to-End (Headless Probe + Multiplexing)
-You can verify the entire lifecycle without a graphical Factorio client using `make verify` (or `./hack/test-e2e.sh`):
+### 4. Verify & Prove End-to-End (Headless Probe, Live Watch, & Stateful World Persistence)
+You can watch Actor state transitions live in one terminal while running the end-to-end stateful proof in another:
 
 ```bash
-make verify
+# Terminal 1: Live Actor & UDP Gateway dashboard (or `make watch-transitions` for timestamped log)
+make watch
+
+# Terminal 2: Full stateful proof (spawns a steel-chest with 42 science packs at (0.5, 0.5) on nauvis,
+# multiplexes to world-deathworld evicting world-vanilla to GCS, wakes world-vanilla back up from GCS,
+# and verifies the chest + 42 science packs survived!)
+make prove
+
+# Trigger an immediate Docker Hub check & ActorTemplate upgrade check on factorio-gateway:
+make check-update
 ```
 
 To also verify the automatic idle-timeout RCON save + suspend cycle using a shortened 30-second timeout (and automatically restore the 10-minute timeout afterward):
@@ -133,11 +150,11 @@ make verify-with-idle
 Find the external LoadBalancer IP:
 
 ```bash
-kubectl -n ate-system get svc factorio-gateway-udp
+kubectl -n factorio get svc factorio-gateway
 ```
 
 In the Factorio 2.1.x game client (**Multiplayer -> Connect to address**):
-- **Vanilla World:** `<EXTERNAL-IP>:34197`
+- **Vanilla World:** `<EXTERNAL-IP>:34197` (walk to `(0.5, 0.5)` at spawn to see the `steel-chest` containing `42` `automation-science-pack`s!)
 - **Deathworld:** `<EXTERNAL-IP>:34198`
 
-*(Note: If the world is currently suspended, the first connection attempt triggers `ResumeActor` in the background; if the Factorio client times out while the world restores, simply click **Connect** a second time once the world is awake.)*
+*(Note: If the world is currently suspended, the first connection attempt triggers `ResumeActor` in the background; if a cold restore or version migration takes longer than the client's retry window, simply click **Connect** a second time once the world is awake.)*

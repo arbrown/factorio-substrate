@@ -1,4 +1,4 @@
-.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions clean
+.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update clean
 
 test:
 	go test -v -race ./...
@@ -23,6 +23,10 @@ watch:
 
 watch-transitions:
 	./hack/watch-actors.sh --transitions
+
+check-update:
+	@kubectl run curl-check-update --rm -i --restart=Never -n factorio --image=curlimages/curl:latest -- \
+		curl -sS -X POST http://factorio-gateway-http.factorio.svc.cluster.local:8080/check-update | jq .
 
 verify-with-idle:
 	IDLE_TIMEOUT=30s ./hack/deploy.sh

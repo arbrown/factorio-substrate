@@ -71,6 +71,11 @@ spec:
         - "--ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem"
         - "--ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
         - "--ateapi-server-name=api.ate-system.svc"
+        - "--image-poll-interval=30m"
+        - "--template-atespace=factorio"
+        - "--template-name=factorio-server"
+        - "--upstream-repo=factoriotools/factorio"
+        - "--upstream-tag=stable"
         ports:
         - name: udp-vanilla
           containerPort: 34197

@@ -301,10 +301,74 @@ factorio   world-vanilla      factorio/factorio-server   ACTOR_STATE_SUSPENDED  
 ==> End-to-End Factorio on Agent Substrate test PASSED!
 ```
 
-Look at those numbers:
-1. **Wake-on-UDP in 1.58 seconds:** Both `world-vanilla` and `world-deathworld` start in `ACTOR_STATE_SUSPENDED`. When `factorio-probe` sends a Factorio UDP `ConnectionRequest` to `:34197`, `factorio-gateway` calls `ResumeActor` (`1,533ms`), opens the WebSocket tunnel through `atenet-router`, flushes the buffered UDP handshake, and receives a genuine `0xd2` `ConnectionRequestReply` from Factorio 2.1.23 in **1.579s** total—well inside the Factorio client's ~10-second connection retry window!
+ Look at those numbers:
+1. **Wake-on-UDP in 1.51 seconds:** Both `world-vanilla` and `world-deathworld` start in `ACTOR_STATE_SUSPENDED`. When `factorio-probe` sends a Factorio UDP `ConnectionRequest` to `:34197`, `factorio-gateway` calls `ResumeActor`, opens the WebSocket tunnel through `atenet-router`, flushes the buffered UDP handshake, and receives a genuine `0xd2` `ConnectionRequestReply` from Factorio in **1.51s** total—well inside the Factorio client's ~10-second connection retry window!
 2. **Single-worker world swap in 3.37 seconds:** When `factorio-probe` hits `:34198` (`world-deathworld`), `factorio-gateway` triggers an RCON `/server-save` on `world-vanilla`, checkpoints `world-vanilla` to GCS, and restores `world-deathworld` (`1,398ms`) onto the **exact same worker pod** (`factorio-ff7cdf57b-7j9t8`) in **3.373s**.
 3. **Automatic idle suspend:** After the idle timeout elapses with zero player UDP replies, `factorio-gateway` runs RCON `/server-save` and suspends `world-deathworld` back to `ACTOR_STATE_SUSPENDED`.
+
+---
+
+## Proving Stateful Persistence (The Steel Chest Test)
+
+Seeing a UDP handshake succeed is great, but how do we *prove* that in-game entities modified in RAM actually survive being evicted from the single worker pod to GCS and restored later?
+
+We added two targets to the `Makefile`:
+* `make watch` (`./hack/watch-actors.sh`): A live terminal dashboard showing Actor states, assigned worker pods, GCS snapshot URIs, and gateway UDP counters in real time.
+* `make prove` (`./hack/prove-e2e.sh`): An end-to-end stateful proof that:
+  1. Wakes `world-vanilla` via UDP (`35.255.124.245:34197`).
+  2. Executes RCON Lua on `world-vanilla` to spawn a **`steel-chest` at `(0.5, 0.5)` on `nauvis` containing `42` `automation-science-pack`s** (`NAUVIS_CHEST_SCIENCE_PACKS=42`).
+  3. Connects to `world-deathworld` on `:34198`, forcing the single worker pod to save and evict `world-vanilla` to GCS (`ACTOR_STATE_SUSPENDED`, `pod=<none>`) and confirming `world-deathworld` has `0` items at `(0.5, 0.5)`.
+  4. Re-connects to `world-vanilla` on `:34197` (evicting `world-deathworld` and restoring `world-vanilla` from GCS) and runs a read-only RCON Lua query verifying the `steel-chest` is still sitting at `(0.5, 0.5)` with `NAUVIS_CHEST_SCIENCE_PACKS=42`!
+
+Even better: if you connect with a real Factorio game client on `:34197` right after running `make prove`, your character spawns right next to `(0.5, 0.5)`—and the steel chest with 42 red science packs is waiting for you in-game.
+
+---
+
+## What Happens When Steam Auto-Updates Factorio? (Zero-Touch Upgrades)
+
+While testing this post with a real Factorio client on a gaming PC, we hit a classic dedicated-server headache: **Steam had just auto-updated the desktop client from Factorio `2.1.23` to `2.1.24`**, and Factorio's multiplayer handshake strictly enforces exact `major.minor.patch` version matching!
+
+In a traditional VM or StatefulSet setup, you might restart the pod with `:stable`. Wait—how does that work with **Agent Substrate**, where:
+1. `ActorTemplate`s are immutable and pin container images by `@sha256:...` digest?
+2. Each world (`world-vanilla`, `world-deathworld`) is a `SNAPSHOT_CONTENT_SCOPE_FULL` gVisor memory checkpoint tied to the exact binary that created it?
+3. Do we have to recreate the Actors or lose our saves?
+
+### How Agent Substrate Upgrades Actors In-Place (`TemplateReplaced` $\rightarrow$ `SNAPSHOT_SCOPE_DATA`)
+
+We dug into Agent Substrate's resume workflow (`workflow_resume.go`), and it turns out Substrate has a built-in mechanism for **in-place template upgrades**:
+* Every `Actor` references its `ActorTemplate` by **name** (`factorio/factorio-server`), and records the `uid` of the template its last snapshot was taken on in `.status.currentActorTemplateUid`.
+* When you replace the `factorio/factorio-server` `ActorTemplate` with a new container image digest (`index.docker.io/factoriotools/factorio@sha256:...`), the new template gets a new `metadata.uid` and builds a fresh Golden Snapshot in the background.
+* You **do not** delete or recreate `world-vanilla` or `world-deathworld`!
+* The next time `world-vanilla` wakes up, Substrate's `loadActorForResume` compares the UIDs:
+  ```go
+  TemplateReplaced: builtOnTemplateUID != "" && builtOnTemplateUID != actorTemplate.GetMetadata().GetUid()
+  ```
+* When `TemplateReplaced` is `true`, Substrate automatically switches **that single wake-up** from `SNAPSHOT_SCOPE_FULL` (memory restore) to **`SNAPSHOT_SCOPE_DATA` (`RESUME_SOURCE_COLD_BOOT`)**!
+* Inside the worker pod, `ateom-gvisor` extracts only the Actor's `durable-dir.tar.zstd` (`/factorio/saves/_autosave1.zip`) into the **new** Factorio `2.1.24` container and cold-boots `/opt/factorio/bin/x64/factorio --start-server-load-latest`. Factorio automatically migrates `_autosave1.zip` from `2.1.23` to `2.1.24`, and Substrate stamps the new `currentActorTemplateUid`.
+* From the very next suspend onward, `world-vanilla` is right back on **1.5-second `SNAPSHOT_SCOPE_FULL` memory restores** on `2.1.24`!
+
+### Automating Both Ends in `factorio-gateway`: Proactive + Reactive
+
+To make Steam updates completely hands-off, we built **two complementary auto-upgrade triggers** directly into `factorio-gateway`:
+
+1. **Proactive Background Docker Hub Watcher (`--image-poll-interval=30m`):**
+   While all worlds are `SUSPENDED`, `factorio-gateway` polls Docker Hub (`factoriotools/factorio:stable`) every 30 minutes. As soon as Wube publishes a new `stable` `@sha256:...` digest, `factorio-gateway` calls `GetActorTemplate` $\rightarrow$ `DeleteActorTemplate` $\rightarrow$ `CreateActorTemplate` over mTLS gRPC and waits for the new Golden Snapshot to build while nobody is online.
+2. **Reactive Client Version Sniffer on UDP `ConnectionRequest`:**
+   What if Steam updates your desktop client 5 minutes after a new Factorio patch drops—*before* the 30-minute background poll has fired?
+   Every Factorio UDP `ConnectionRequest` (`0x02`) packet carries the client's 4-byte `ApplicationVersion` (`[0x02, minor, patch, 0x00]`, e.g., `02 01 18 00` for `2.1.24.0`) right in the packet header. `factorio-gateway` inspects those 4 bytes on every incoming connection attempt. If a connecting client advertises a version newer than `known_server_version`, `factorio-gateway` immediately queries Docker Hub, replaces `factorio/factorio-server`, and upgrades the server on the spot!
+
+You can inspect the live auto-upgrade state at any time via `GET /status` or trigger an immediate check with `make check-update` (`POST /check-update`):
+
+```json
+{
+  "upgraded": false,
+  "reason": "manual-http-trigger",
+  "template_uid": "23845143-3481-4b33-9f97-ab5df1421737",
+  "template_image": "index.docker.io/factoriotools/factorio@sha256:0ef394757b906f8e2e42d7e1f05332ad7cf7575c40d9b2412fa4c477189bdea7",
+  "upstream_digest": "sha256:0ef394757b906f8e2e42d7e1f05332ad7cf7575c40d9b2412fa4c477189bdea7",
+  "upstream_version": "2.1.24"
+}
+```
 
 ---
 
