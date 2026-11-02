@@ -58,6 +58,7 @@ containers:
     if [ ! -f /factorio/config/server-adminlist.json ]; then
       printf '[\n  "drewbr"\n]\n' > /factorio/config/server-adminlist.json
     fi
+    rm -f /factorio/saves/*.tmp.zip
     if [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
       /opt/factorio/bin/x64/factorio \
         -c /factorio/config/config.ini \
