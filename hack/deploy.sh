@@ -27,6 +27,7 @@ fi
 : "${KO_DOCKER_REPO:?KO_DOCKER_REPO must be set (see .ate-dev-env.sh.example)}"
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-10m}"
+WORLDS=(world-vanilla world-deathworld world-railworld world-ribbonworld)
 
 KO_BIN="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh --print-bin-path ko)"
 run_ko() {
@@ -76,16 +77,30 @@ fi
 FACTORIO_IMAGE="${FACTORIO_IMAGE:-index.docker.io/factoriotools/factorio@${FACTORIO_DIGEST}}"
 echo "    FACTORIO_IMAGE=${FACTORIO_IMAGE}"
 
-echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready with ${FACTORIO_IMAGE})..."
+echo "==> Rendering 'factorio-server' ActorTemplate with ko..."
+RENDERED_TEMPLATE="$(sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
+    -e "s|\${FACTORIO_IMAGE}|${FACTORIO_IMAGE}|g" \
+    manifests/factorio-template.yaml.tmpl \
+  | run_ko resolve -f -)"
+NEW_SIDECAR_IMAGE="$(echo "${RENDERED_TEMPLATE}" | grep -A2 'name: sidecar' | awk '/image:/ {print $2}')"
+
+if [[ "${RESET_WORLDS:-false}" == "true" ]]; then
+  echo "==> RESET_WORLDS=true: deleting existing world Actors so they generate fresh custom maps on next connect..."
+  for ACTOR in "${WORLDS[@]}"; do
+    run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+  done
+fi
+
+echo "==> Checking 'factorio-server' ActorTemplate..."
 if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
   TMPL_JSON="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json)"
   SNAP_URI="$(echo "${TMPL_JSON}" | jq -r '.status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty')"
   CUR_FACTORIO_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="factorio") | .image // empty')"
-  if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" ]]; then
+  CUR_SIDECAR_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="sidecar") | .image // empty')"
+  if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" || "${CUR_SIDECAR_IMAGE}" != "${NEW_SIDECAR_IMAGE}" || "${RECREATE_TEMPLATE:-false}" == "true" ]]; then
     OLD_UID="$(echo "${TMPL_JSON}" | jq -r '.metadata.uid // empty')"
-    echo "    Recreating factorio-server ActorTemplate (old image=${CUR_FACTORIO_IMAGE}, new image=${FACTORIO_IMAGE})..."
-    echo "    (Existing Actors keep their /factorio saves; Substrate will auto-upgrade them via SNAPSHOT_SCOPE_DATA on next wake)"
-    for ACTOR in world-vanilla world-deathworld; do
+    echo "    Recreating factorio-server ActorTemplate (factorio=${FACTORIO_IMAGE}, sidecar=${NEW_SIDECAR_IMAGE})..."
+    for ACTOR in "${WORLDS[@]}"; do
       if [[ "${RESET_WORLDS:-false}" == "true" ]]; then
         run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
       else
@@ -102,11 +117,7 @@ if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&
   fi
 fi
 if ! run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
-  sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
-      -e "s|\${FACTORIO_IMAGE}|${FACTORIO_IMAGE}|g" \
-      manifests/factorio-template.yaml.tmpl \
-    | run_ko resolve -f - \
-    | run_kubectl_ate create actor-template -f -
+  echo "${RENDERED_TEMPLATE}" | run_kubectl_ate create actor-template -f -
 fi
 
 echo "==> Waiting for 'factorio-server' ActorTemplate Golden Snapshot to become Ready..."
@@ -124,8 +135,8 @@ for i in {1..90}; do
   sleep 5
 done
 
-echo "==> Creating Factorio world Actors (world-vanilla and world-deathworld)..."
-for ACTOR in world-vanilla world-deathworld; do
+echo "==> Creating Factorio world Actors (${WORLDS[*]})..."
+for ACTOR in "${WORLDS[@]}"; do
   if ! run_kubectl_ate get actor "${ACTOR}" -a factorio >/dev/null 2>&1; then
     run_kubectl_ate create actor "${ACTOR}" -a factorio --template factorio-server
   fi

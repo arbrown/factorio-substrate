@@ -27,6 +27,7 @@ containers:
   - /ko-app/factorio-sidecar
   args:
   - "--listen-addr=:80"
+  - "--control-addr=127.0.0.1:27016"
   - "--factorio-udp-addr=127.0.0.1:34197"
   - "--factorio-rcon-addr=127.0.0.1:27015"
   - "--factorio-dir="
@@ -48,32 +49,97 @@ containers:
   - |
     mkdir -p /factorio/saves /factorio/config /factorio/mods /factorio/scenarios /factorio/script-output
     printf "[path]\nread-data=__PATH__executable__/../../data\nwrite-data=/factorio\n" > /factorio/config/config.ini
-    if [ ! -f /factorio/config/server-settings.json ]; then
-      sed \
-        -e 's/"public": true/"public": false/g' \
-        -e 's/"lan": true/"lan": false/g' \
-        -e 's/"require_user_verification": true/"require_user_verification": false/g' \
-        /opt/factorio/data/server-settings.example.json > /factorio/config/server-settings.json
-    fi
     if [ ! -f /factorio/config/server-adminlist.json ]; then
-      printf '[\n  "drewbr"\n]\n' > /factorio/config/server-adminlist.json
+      printf '[\n  "drewbr",\n  "drewmate"\n]\n' > /factorio/config/server-adminlist.json
     fi
     rm -f /factorio/saves/*.tmp.zip
-    if [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
+
+    fetch_sidecar() {
+      local attempt
+      for attempt in $(seq 1 100); do
+        if exec 3<>/dev/tcp/127.0.0.1/27016 2>/dev/null; then
+          printf "%s\n" "$1" >&3
+          cat <&3
+          exec 3>&-
+          return 0
+        fi
+        sleep 0.05
+      done
+      return 1
+    }
+
+    while true; do
+      TARGET_ACTOR="$(fetch_sidecar "actor-name" | tr -d '\r\n')"
+      if [ -z "${TARGET_ACTOR}" ]; then
+        TARGET_ACTOR="golden"
+      fi
+      SAVED_ACTOR="$(cat /factorio/saves/.actor-name 2>/dev/null | tr -d '\r\n' || true)"
+
+      if [ "${TARGET_ACTOR}" = "golden" ] && [ -n "${SAVED_ACTOR}" ] && [ "${SAVED_ACTOR}" != "golden" ]; then
+        TARGET_ACTOR="${SAVED_ACTOR}"
+      fi
+
+      IS_NEW_MAP="false"
+      if [ "${SAVED_ACTOR}" != "${TARGET_ACTOR}" ] || [ -z "$(ls -A /factorio/saves/*.zip 2>/dev/null || true)" ]; then
+        echo "==> Generating fresh Factorio map for Actor '${TARGET_ACTOR}' (previous='${SAVED_ACTOR}')..."
+        fetch_sidecar "server-settings.json" > /factorio/config/server-settings.json
+        fetch_sidecar "map-gen-settings.json" > /factorio/config/map-gen-settings.json
+        PRESET="$(fetch_sidecar "preset" | tr -d '\r\n')"
+        rm -f /factorio/saves/*.zip /factorio/saves/*.tmp.zip
+        if [ "${TARGET_ACTOR}" = "golden" ]; then
+          /opt/factorio/bin/x64/factorio \
+            -c /factorio/config/config.ini \
+            --create /factorio/saves/_autosave1.zip
+        else
+          if ! /opt/factorio/bin/x64/factorio \
+            -c /factorio/config/config.ini \
+            --create /factorio/saves/_autosave1.zip \
+            --map-gen-preset "${PRESET}" \
+            --map-gen-settings /factorio/config/map-gen-settings.json; then
+            echo "WARN: --map-gen-settings failed; falling back to --map-gen-preset ${PRESET}"
+            /opt/factorio/bin/x64/factorio \
+              -c /factorio/config/config.ini \
+              --create /factorio/saves/_autosave1.zip \
+              --map-gen-preset "${PRESET}"
+          fi
+        fi
+        printf "%s\n" "${TARGET_ACTOR}" > /factorio/saves/.actor-name
+        IS_NEW_MAP="true"
+      fi
+
       /opt/factorio/bin/x64/factorio \
         -c /factorio/config/config.ini \
-        --create /factorio/saves/_autosave1.zip
-    fi
-    exec /opt/factorio/bin/x64/factorio \
-      -c /factorio/config/config.ini \
-      --port 34197 \
-      --server-settings /factorio/config/server-settings.json \
-      --server-adminlist /factorio/config/server-adminlist.json \
-      --rcon-bind 127.0.0.1:27015 \
-      --rcon-password "substrate-factorio-rcon" \
-      --server-id /factorio/config/server-id.json \
-      --mod-directory /factorio/mods \
-      --start-server-load-latest
+        --port 34197 \
+        --server-settings /factorio/config/server-settings.json \
+        --server-adminlist /factorio/config/server-adminlist.json \
+        --rcon-bind 127.0.0.1:27015 \
+        --rcon-password "substrate-factorio-rcon" \
+        --server-id /factorio/config/server-id.json \
+        --mod-directory /factorio/mods \
+        --start-server-load-latest &
+      FACTORIO_PID=$!
+
+      if [ "${IS_NEW_MAP}" = "true" ]; then
+        fetch_sidecar "ready-new:${TARGET_ACTOR}" >/dev/null || true
+      else
+        fetch_sidecar "ready-existing:${TARGET_ACTOR}" >/dev/null || true
+      fi
+
+      if [ "${TARGET_ACTOR}" = "golden" ]; then
+        while kill -0 "${FACTORIO_PID}" 2>/dev/null; do
+          NEW_TARGET="$(fetch_sidecar "actor-name" | tr -d '\r\n' || true)"
+          if [ -n "${NEW_TARGET}" ] && [ "${NEW_TARGET}" != "golden" ]; then
+            echo "==> Actor restored from Golden Snapshot as '${NEW_TARGET}'; stopping placeholder server to generate custom map..."
+            kill -TERM "${FACTORIO_PID}" 2>/dev/null || true
+            wait "${FACTORIO_PID}" 2>/dev/null || true
+            break
+          fi
+          sleep 0.1
+        done
+      else
+        wait "${FACTORIO_PID}" 2>/dev/null || true
+      fi
+    done
   readyz:
     httpGet:
       path: /readyz
