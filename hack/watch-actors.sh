@@ -50,7 +50,7 @@ if [[ "${MODE}" == "--transitions" ]]; then
         fi
         prev_line["${name}"]="${summary}"
       fi
-    done < <("${KUBECTL_ATE_BIN}" get actors -a factorio -o json 2>/dev/null | jq -r '.items[]? | [.metadata.name, .status.state, (.status.workerAssignment.workerPodNamespace + "/" + .status.workerAssignment.workerPodName | if . == "/" then "<none>" else . end), .metadata.version] | @tsv')
+    done < <("${KUBECTL_ATE_BIN}" get actors -a factorio -o json 2>/dev/null | jq -r '.actors[]? | [.metadata.name, .status.state, ((.status.workerAssignment.workerPodNamespace // "") + "/" + (.status.workerAssignment.workerPodName // "") | if . == "/" then "<none>" else . end), .metadata.version] | @tsv')
     sleep "${INTERVAL}"
   done
 else
