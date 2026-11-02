@@ -803,22 +803,18 @@ func (wt *WorldTunnel) wsReadLoop(ctx context.Context, ws *websocket.Conn) {
 		}
 		srvVer, hasSrvVer := tunnelproto.ParseServerReplyVersion(payload)
 
+		if hasSrvVer {
+			wt.mu.Lock()
+			wt.lastServerVersion = srvVer
+			wt.mu.Unlock()
+			wt.gw.recordServerVersion(srvVer)
+		}
+
 		wt.mu.Lock()
 		raddr := wt.clientAddrs[clientKey]
 		// Reset the 10-minute idle timer ONLY when Factorio sends a reply packet!
 		wt.lastOutboundReply = time.Now()
-		if hasSrvVer {
-			wt.lastServerVersion = srvVer
-		}
-		clientVer := wt.lastClientVersion
 		wt.mu.Unlock()
-
-		if hasSrvVer {
-			wt.gw.recordServerVersion(srvVer)
-			if clientVer != "" && tunnelproto.CompareVersions(clientVer, srvVer) > 0 {
-				go wt.gw.handleReactiveVersionMismatch(ctx, wt, clientVer)
-			}
-		}
 
 		if raddr == nil {
 			parsed, err := net.ResolveUDPAddr("udp4", clientKey)
@@ -931,9 +927,10 @@ func (gw *Gateway) maybeUpgradeBeforeWake(ctx context.Context, wakingWorld *Worl
 	srvVer := gw.knownServerVersion
 	gw.metaMu.Unlock()
 
-	// If knownServerVersion isn't known yet or clientVer is newer, check upstream before waking.
-	if srvVer == "" || tunnelproto.CompareVersions(clientVer, srvVer) > 0 {
-		slog.Info("Client version triggers pre-wake Docker Hub check",
+	// Only block wake-up if we know the current server version and the connecting
+	// client is strictly newer (e.g. Steam updated the client from 2.1.24 to 2.1.25).
+	if srvVer != "" && tunnelproto.CompareVersions(clientVer, srvVer) > 0 {
+		slog.Info("Client version is newer than server version; triggering pre-wake Docker Hub upgrade",
 			"actor", wakingWorld.spec.ActorRef(),
 			"client_version", clientVer,
 			"known_server_version", srvVer,
@@ -949,7 +946,14 @@ func (gw *Gateway) handleReactiveVersionMismatch(ctx context.Context, wt *WorldT
 	if !gw.isClientNewerThanServer(clientVer) {
 		return
 	}
-	slog.Info("Detected newer Factorio client version against running world; checking upstream for auto-upgrade",
+	// Never interrupt a world that is actively exchanging UDP packets (e.g. map download or active gameplay).
+	wt.mu.Lock()
+	idleFor := time.Since(wt.lastOutboundReply)
+	wt.mu.Unlock()
+	if idleFor < gw.cfg.PreemptIdleGrace {
+		return
+	}
+	slog.Info("Detected newer Factorio client version against idle world; suspending and upgrading",
 		"actor", wt.spec.ActorRef(),
 		"client_version", clientVer,
 	)

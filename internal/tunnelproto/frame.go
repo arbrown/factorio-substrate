@@ -112,7 +112,7 @@ func BuildFactorioProbePacketForVersion(requestID uint32, major, minor, patch ui
 // ParseClientVersion extracts the 3-component Factorio version ("2.x.y") from
 // an inbound client UDP ConnectionRequest (0x02) packet, if present.
 func ParseClientVersion(pkt []byte) (string, bool) {
-	if len(pkt) < 5 || (pkt[0]&FactorioMessageTypeMask) != FactorioMsgConnectionRequest {
+	if len(pkt) < 12 || len(pkt) > 64 || (pkt[0]&FactorioMessageTypeMask) != FactorioMsgConnectionRequest {
 		return "", false
 	}
 	return scanFactorio2VersionBytes(pkt[1:])
@@ -120,17 +120,23 @@ func ParseClientVersion(pkt []byte) (string, bool) {
 
 // ParseServerReplyVersion extracts the 3-component Factorio version ("2.x.y")
 // from an outbound server ConnectionRequestReply packet (e.g. d2 04 80 00 01 02 01 18 00),
-// if present.
+// if present. It strictly checks the 9-byte ConnectionRequestReply header so
+// compressed map transfer chunks (TransferBlock) are never misidentified as
+// version headers.
 func ParseServerReplyVersion(pkt []byte) (string, bool) {
-	if !IsFactorioServerReply(pkt) || len(pkt) < 9 {
+	if len(pkt) < 9 || len(pkt) > 64 {
 		return "", false
 	}
-	// In Factorio 2.x ConnectionRequestReply packets, the 4-byte
-	// ApplicationVersion [2, minor, patch, 0] sits at offset 5 (pkt[5:9]).
-	if len(pkt) >= 9 && isFactorio2VersionQuad(pkt[5:9]) {
+	msgType := pkt[0] & FactorioMessageTypeMask
+	isConnReply := msgType == FactorioMsgConnectionRequestReply ||
+		(pkt[0] == 0xd2 && pkt[2] == 0x80 && pkt[4] == 0x01)
+	if !isConnReply {
+		return "", false
+	}
+	if isFactorio2VersionQuad(pkt[5:9]) {
 		return fmt.Sprintf("%d.%d.%d", pkt[5], pkt[6], pkt[7]), true
 	}
-	return scanFactorio2VersionBytes(pkt[1:])
+	return "", false
 }
 
 func scanFactorio2VersionBytes(b []byte) (string, bool) {
@@ -147,7 +153,9 @@ func scanFactorio2VersionBytes(b []byte) (string, bool) {
 }
 
 func isFactorio2VersionQuad(q []byte) bool {
-	return len(q) == 4 && q[0] == 2 && q[1] <= 20 && q[2] <= 250 && q[3] == 0
+	// Factorio 2.1.x+ releases have major==2, minor>=1, patch>=1, build==0.
+	// Requiring minor>=1 && patch>=1 prevents matching 02 00 00 00 inside binary headers.
+	return len(q) == 4 && q[0] == 2 && q[1] >= 1 && q[1] <= 20 && q[2] >= 1 && q[2] <= 250 && q[3] == 0
 }
 
 // CompareVersions compares two dotted numeric version strings (e.g. "2.1.24" vs "2.1.23").

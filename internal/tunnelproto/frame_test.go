@@ -91,6 +91,14 @@ func TestVersionParsingAndComparison(t *testing.T) {
 		t.Fatalf("ParseServerReplyVersion(reply24) = %q, %v; want 2.1.24, true", v, ok)
 	}
 
+	// Ensure a map download TransferBlock packet (msgType 0x0c) containing
+	// arbitrary bytes like 02 00 00 00 or 02 01 14 00 is NEVER misparsed as a
+	// ConnectionRequestReply version header!
+	mapTransferBlock := []byte{0x0c, 0x00, 0x01, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0xaa, 0xbb}
+	if v, ok := ParseServerReplyVersion(mapTransferBlock); ok {
+		t.Fatalf("expected map TransferBlock to be ignored by ParseServerReplyVersion, got %q", v)
+	}
+
 	if cmp := CompareVersions("2.1.24", "2.1.23"); cmp != 1 {
 		t.Errorf("CompareVersions(2.1.24, 2.1.23) = %d, want 1", cmp)
 	}
