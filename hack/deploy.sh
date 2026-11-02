@@ -84,8 +84,13 @@ if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&
   if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" ]]; then
     OLD_UID="$(echo "${TMPL_JSON}" | jq -r '.metadata.uid // empty')"
     echo "    Recreating factorio-server ActorTemplate (old image=${CUR_FACTORIO_IMAGE}, new image=${FACTORIO_IMAGE})..."
+    echo "    (Existing Actors keep their /factorio saves; Substrate will auto-upgrade them via SNAPSHOT_SCOPE_DATA on next wake)"
     for ACTOR in world-vanilla world-deathworld; do
-      run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+      if [[ "${RESET_WORLDS:-false}" == "true" ]]; then
+        run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+      else
+        run_kubectl_ate suspend actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+      fi
     done
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
     if [[ -n "${OLD_UID}" ]]; then
