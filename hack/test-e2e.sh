@@ -56,6 +56,12 @@ if [[ -z "${EXTERNAL_IP}" ]]; then
 fi
 echo "    EXTERNAL_IP=${EXTERNAL_IP}"
 
+echo "==> Starting port-forward to factorio-gateway-http (:18080 -> :8080)..."
+kubectl port-forward -n factorio svc/factorio-gateway-http 18080:8080 >/dev/null 2>&1 &
+PF_PID=$!
+trap 'kill "${PF_PID}" >/dev/null 2>&1 || true' EXIT
+sleep 2
+
 echo "==> Step 1: Checking initial Actor states..."
 run_kubectl_ate get actor -a factorio
 
@@ -64,8 +70,8 @@ go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=60s
 
 echo "==> Step 3: Verifying world-vanilla is RUNNING and querying RCON status..."
 run_kubectl_ate get actor world-vanilla -a factorio
-curl -fsS "http://${EXTERNAL_IP}:8080/world-status?actor=factorio/world-vanilla" && echo ""
-curl -fsS "http://${EXTERNAL_IP}:8080/status" && echo ""
+curl -fsS "http://127.0.0.1:18080/world-status?actor=factorio/world-vanilla" && echo ""
+curl -fsS "http://127.0.0.1:18080/status" && echo ""
 
 echo "==> Step 4: Waiting 6s (preempt grace) then probing world-deathworld on ${EXTERNAL_IP}:34198/UDP to test single-worker multiplexing..."
 sleep 6
@@ -73,15 +79,15 @@ go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34198" --timeout=60s
 
 echo "==> Step 5: Verifying world-vanilla was suspended and world-deathworld is now RUNNING..."
 run_kubectl_ate get actor -a factorio
-curl -fsS "http://${EXTERNAL_IP}:8080/world-status?actor=factorio/world-deathworld" && echo ""
-curl -fsS "http://${EXTERNAL_IP}:8080/status" && echo ""
+curl -fsS "http://127.0.0.1:18080/world-status?actor=factorio/world-deathworld" && echo ""
+curl -fsS "http://127.0.0.1:18080/status" && echo ""
 
 if [[ "${VERIFY_IDLE_SUSPEND:-false}" == "true" ]]; then
   WAIT_SECS="${IDLE_WAIT_SECS:-45}"
   echo "==> Step 6: Waiting ${WAIT_SECS}s for zero-UDP idle auto-suspend..."
   sleep "${WAIT_SECS}"
   run_kubectl_ate get actor -a factorio
-  curl -fsS "http://${EXTERNAL_IP}:8080/status" && echo ""
+  curl -fsS "http://127.0.0.1:18080/status" && echo ""
 fi
 
 echo "==> End-to-End Factorio on Agent Substrate test PASSED!"
