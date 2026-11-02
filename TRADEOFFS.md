@@ -81,11 +81,18 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
   - Agent Substrate containers inside the gVisor sandbox default to only `AUDIT_WRITE`, `KILL`, and `NET_BIND_SERVICE` capabilities (`CAP_SETUID`, `CAP_SETGID`, and `CAP_CHOWN` are not granted by default).
   - When `factoriotools/factorio:stable` starts as UID 0, its upstream `/docker-entrypoint.sh` attempts to run `usermod`, `groupmod`, `chown -R factorio:factorio /factorio`, and `runuser -u factorio`, which fail without those capabilities.
 * **Our Solution:**
-  - In [`manifests/factorio-template.yaml.tmpl`](manifests/factorio-template.yaml.tmpl), we override `command` on the `factorio` container to wait for `/factorio/config/.initialized` (written by `factorio-sidecar`), run `/opt/factorio/bin/x64/factorio --create /factorio/saves/_autosave1.zip` if no save exists yet, and `exec /opt/factorio/bin/x64/factorio` directly with `-c /factorio/config/config.ini`. This avoids both capability errors and startup race conditions between the two containers.
+  - In [`manifests/factorio-template.yaml.tmpl`](manifests/factorio-template.yaml.tmpl), we override `command` on the `factorio` container to initialize `/factorio/config/*`, run `/opt/factorio/bin/x64/factorio --create /factorio/saves/_autosave1.zip` if no save exists yet, and `exec /opt/factorio/bin/x64/factorio` directly with `-c /factorio/config/config.ini`. This avoids capability errors while keeping all `/factorio` volume access inside the `factorio` container.
 
 ### Trade-off 9: `atelet` OCI Image Unpacker vs. `ko` Default Base Image
 * **The Constraint:**
   - When `ko` builds Go binaries without a `.ko.yaml`, it defaults to `cgr.dev/chainguard/static:latest`. That image's rootfs layer includes a `/dev/console` character device tar entry (`tar.TypeChar`, `typeflag "3"`), which `atelet`'s `imageCache.EnsureImage` rejects with `unhandled tar entry typeflag "3"`.
 * **Our Solution:**
   - We configure [`.ko.yaml`](.ko.yaml) with `defaultBaseImage: gcr.io/distroless/static-debian13:latest`, matching Agent Substrate's own `.ko.yaml` and ensuring all image layers contain only regular files, directories, and symlinks.
+
+### Trade-off 10: RCON `/server-save` Flush Timing & `.tmp.zip` Cleanup on Cold Boot
+* **The Constraint:**
+  - When `factorio-sidecar` issues `/server-save` over RCON right before `SuspendActor`, Factorio writes the save to `/factorio/saves/_autosave1.tmp.zip` and atomically renames it to `/factorio/saves/_autosave1.zip`. If `SuspendActor` freezes the container while `_autosave1.tmp.zip` is still being written—and the Actor later cold-boots from `SNAPSHOT_CONTENT_SCOPE_DATA` (`--start-server-load-latest`)—Factorio selects `_autosave1.tmp.zip` as the newest `.zip` file in `/factorio/saves/` and fails with an I/O error on the incomplete archive.
+* **Our Solution:**
+  - In `factorio-sidecar`'s `/prepare-suspend` handler, we issue a follow-up synchronous RCON `/version` query after `/server-save` as a serialization barrier on Factorio's main loop, and in `factorio-template.yaml.tmpl` we run `rm -f /factorio/saves/*.tmp.zip` before `--start-server-load-latest` so any interrupted temporary archive is discarded in favor of the last complete `.zip` save.
+
 
