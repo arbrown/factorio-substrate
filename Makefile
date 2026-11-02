@@ -1,4 +1,4 @@
-.PHONY: test build deploy verify clean
+.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions clean
 
 test:
 	go test -v -race ./...
@@ -14,6 +14,15 @@ deploy:
 
 verify:
 	./hack/test-e2e.sh
+
+prove:
+	./hack/prove-e2e.sh
+
+watch:
+	./hack/watch-actors.sh
+
+watch-transitions:
+	./hack/watch-actors.sh --transitions
 
 verify-with-idle:
 	IDLE_TIMEOUT=30s ./hack/deploy.sh
