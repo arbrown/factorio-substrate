@@ -69,7 +69,7 @@ fi
 
 echo "==> Creating 'factorio-server' ActorTemplate (if not already Ready)..."
 if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
-  SNAP_URI="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshot.snapshotUri // empty')"
+  SNAP_URI="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty')"
   if [[ -z "${SNAP_URI}" ]]; then
     OLD_UID="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json | jq -r '.metadata.uid // empty')"
     echo "    Existing factorio-server ActorTemplate (${OLD_UID}) is not Ready; recreating..."
