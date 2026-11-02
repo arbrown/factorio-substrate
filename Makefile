@@ -25,8 +25,7 @@ watch-transitions:
 	./hack/watch-actors.sh --transitions
 
 check-update:
-	@kubectl run curl-check-update --rm -i --restart=Never -n factorio --image=curlimages/curl:latest -- \
-		curl -sS -X POST http://factorio-gateway-http.factorio.svc.cluster.local:8080/check-update | jq .
+	@bash -c 'kubectl port-forward -n factorio svc/factorio-gateway-http 18082:8080 >/dev/null 2>&1 & PF=$$!; trap "kill $$PF 2>/dev/null || true" EXIT; sleep 1; curl -fsSL -X POST http://127.0.0.1:18082/check-update | jq .'
 
 verify-with-idle:
 	IDLE_TIMEOUT=30s ./hack/deploy.sh
