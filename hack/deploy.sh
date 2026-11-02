@@ -76,7 +76,7 @@ if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
     if [[ -n "${OLD_UID}" ]]; then
       kubectl exec -n ate-system postgres-0 -c postgres -- psql -U postgres -d atepg -c "DELETE FROM worker_assignments; DELETE FROM workers; DELETE FROM actors WHERE name = '${OLD_UID}';" >/dev/null 2>&1 || true
-      kubectl delete pod -n factorio -l workload=factorio --wait=false >/dev/null 2>&1 || true
+      kubectl delete pod -n factorio -l ate.dev/worker-pool=factorio --wait=false >/dev/null 2>&1 || true
       kubectl rollout status deployment/factorio -n factorio --timeout=120s
     fi
     sleep 2
