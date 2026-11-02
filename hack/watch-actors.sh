@@ -54,10 +54,6 @@ if [[ "${MODE}" == "--transitions" ]]; then
     sleep "${INTERVAL}"
   done
 else
-  kubectl port-forward -n factorio svc/factorio-gateway-http 18089:8080 >/dev/null 2>&1 &
-  PF_PID=$!
-  trap 'kill "${PF_PID}" >/dev/null 2>&1 || true; rm -f "${KUBECTL_ATE_BIN}"' EXIT
-  sleep 1
   while true; do
     clear
     echo "================================================================================"
@@ -68,7 +64,7 @@ else
     "${KUBECTL_ATE_BIN}" get actors -a factorio || true
     echo ""
     echo "--- UDP Gateway Status (:8080/status) ---"
-    curl -fsS http://127.0.0.1:18089/status 2>/dev/null | jq . || true
+    kubectl get --raw /api/v1/namespaces/factorio/services/factorio-gateway-http:status-http/proxy/status 2>/dev/null | jq . || true
     sleep "${INTERVAL}"
   done
 fi

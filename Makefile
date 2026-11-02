@@ -1,4 +1,4 @@
-.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update clean
+.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update status clean
 
 test:
 	go test -v -race ./...
@@ -25,7 +25,10 @@ watch-transitions:
 	./hack/watch-actors.sh --transitions
 
 check-update:
-	@bash -c 'kubectl port-forward -n factorio svc/factorio-gateway-http 18082:8080 >/dev/null 2>&1 & PF=$$!; trap "kill $$PF 2>/dev/null || true" EXIT; sleep 1; curl -fsSL -X POST http://127.0.0.1:18082/check-update | jq .'
+	@kubectl get --raw /api/v1/namespaces/factorio/services/factorio-gateway-http:status-http/proxy/check-update | jq .
+
+status:
+	@kubectl get --raw /api/v1/namespaces/factorio/services/factorio-gateway-http:status-http/proxy/status | jq .
 
 verify-with-idle:
 	IDLE_TIMEOUT=30s ./hack/deploy.sh
