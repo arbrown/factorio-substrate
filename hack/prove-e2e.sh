@@ -138,16 +138,18 @@ kubectl logs -n factorio deployment/factorio-gateway --tail=25
 echo ""
 echo "--- 5c. Factorio Server & gVisor Sandbox Logs inside WorkerPool Pod ---"
 WORKER_POD="$(kubectl get pods -n factorio -l ate.dev/worker-pool=factorio -o jsonpath='{.items[0].metadata.name}')"
-kubectl logs -n factorio "${WORKER_POD}" --tail=60 | grep -E '"ate.actor.container.name":"factorio"|runsc restore|Saving game|Goodbye' | tail -n 20 || true
+WORKER_NODE="$(kubectl get pod -n factorio "${WORKER_POD}" -o jsonpath='{.spec.nodeName}')"
+kubectl logs -n factorio "${WORKER_POD}" --tail=400 | grep -E '"ate.actor.container.name":"factorio"|About to run runsc|Saving game' | tail -n 20 || true
 
 echo ""
-echo "--- 5d. Node Agent (atelet) Snapshot Upload/Download Logs ---"
-kubectl logs -n ate-system -l app=atelet --tail=80 | grep -E "Compressed zstd upload|Decompressed zstd download|/atelet.AteomHerder/Checkpoint|/atelet.AteomHerder/Restore" | tail -n 15 || true
+echo "--- 5d. Node Agent (atelet on ${WORKER_NODE}) Snapshot Upload/Download Logs ---"
+ATELET_POD="$(kubectl get pods -n ate-system -l app=atelet --field-selector spec.nodeName="${WORKER_NODE}" -o jsonpath='{.items[0].metadata.name}')"
+kubectl logs -n ate-system "${ATELET_POD}" --tail=100 | grep -E "Compressed zstd upload|Decompressed zstd download|/atelet.AteomHerder/Checkpoint|/atelet.AteomHerder/Restore" | tail -n 15 || true
 
 echo ""
 echo "--- 5e. Actual Snapshot Artifacts in Google Cloud Storage ---"
-VANILLA_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-vanilla -a factorio -o json | jq -r '.status.latestSnapshot.snapshotUri // empty')"
-DEATHWORLD_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-deathworld -a factorio -o json | jq -r '.status.latestSnapshot.snapshotUri // empty')"
+VANILLA_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-vanilla -a factorio -o json | jq -r '.status.externalSnapshot.snapshotUri // empty')"
+DEATHWORLD_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-deathworld -a factorio -o json | jq -r '.status.externalSnapshot.snapshotUri // empty')"
 echo "world-vanilla latest snapshot:    ${VANILLA_SNAP}"
 gcloud storage ls -l "${VANILLA_SNAP}/" || true
 echo "world-deathworld latest snapshot: ${DEATHWORLD_SNAP}"
