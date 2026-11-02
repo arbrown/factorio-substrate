@@ -143,6 +143,17 @@ spec:
     port: 34198
     targetPort: 34198
     protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: factorio-gateway-http
+  namespace: factorio
+spec:
+  type: ClusterIP
+  selector:
+    app: factorio-gateway
+  ports:
   - name: status-http
     port: 8080
     targetPort: 8080
