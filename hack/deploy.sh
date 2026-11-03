@@ -85,8 +85,10 @@ RENDERED_TEMPLATE="$(sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
 NEW_SIDECAR_IMAGE="$(echo "${RENDERED_TEMPLATE}" | grep -A2 'name: sidecar' | awk '/image:/ {print $2}')"
 
 if [[ "${RESET_WORLDS:-false}" == "true" ]]; then
-  echo "==> RESET_WORLDS=true: deleting existing world Actors so they generate fresh custom maps on next connect..."
+  echo "==> RESET_WORLDS=true: suspending and deleting existing world Actors so they generate fresh custom maps on next connect..."
   for ACTOR in "${WORLDS[@]}"; do
+    kubectl create --raw "/api/v1/namespaces/factorio/services/factorio-gateway-http:status-http/proxy/suspend?actor=factorio/${ACTOR}" -f - <<< '{}' >/dev/null 2>&1 || true
+    run_kubectl_ate suspend actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
     run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
   done
 fi
