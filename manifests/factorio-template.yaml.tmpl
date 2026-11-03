@@ -94,13 +94,13 @@ containers:
           if ! /opt/factorio/bin/x64/factorio \
             -c /factorio/config/config.ini \
             --create /factorio/saves/_autosave1.zip \
-            --map-gen-preset "${PRESET}" \
+            --preset "${PRESET}" \
             --map-gen-settings /factorio/config/map-gen-settings.json; then
-            echo "WARN: --map-gen-settings failed; falling back to --map-gen-preset ${PRESET}"
+            echo "WARN: --map-gen-settings failed; falling back to --preset ${PRESET}"
             /opt/factorio/bin/x64/factorio \
               -c /factorio/config/config.ini \
               --create /factorio/saves/_autosave1.zip \
-              --map-gen-preset "${PRESET}"
+              --preset "${PRESET}"
           fi
         fi
         printf "%s\n" "${TARGET_ACTOR}" > /factorio/saves/.actor-name
