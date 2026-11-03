@@ -100,9 +100,13 @@ Agent Substrate makes a different trade-off: you run a warm `WorkerPool` pod (`r
 
 **Unless you multiplex multiple worlds (and agents!) onto that single worker pod.**
 
-In our setup (`manifests/factorio-substrate.yaml.tmpl`), we configure a single 1-replica `WorkerPool` (`2 vCPU, 4 GiB RAM`) and bind **two separate UDP ports** on the Gateway:
-* **UDP `:34197` -> `factorio/world-vanilla`**
-* **UDP `:34198` -> `factorio/world-deathworld`**
+In our setup (`manifests/factorio-substrate.yaml.tmpl`), we configure a single 1-replica `WorkerPool` (`2 vCPU, 4 GiB RAM`) and bind **four separate UDP ports** on the Gateway, each mapped to a distinct Factorio Actor with its own server name, description, map preset, super-dense resource settings (`map-gen-settings.json`), charted map tags, and starter chest:
+* **UDP `:34197` -> `factorio/world-vanilla` (`[Substrate #1] Super-Dense Megabase`)**: `--preset rich-resources` with 600% resource richness, peaceful mode, zero cliffs, and a starter chest with Power Armor, Exoskeletons, Roboports, and Express Belts.
+* **UDP `:34198` -> `factorio/world-deathworld` (`[Substrate #2] Deathworld Biter Swarm`)**: `--preset death-world` with 400% biter nest frequency & size surrounding a 4-turret fortified spawn bunker stocked with Piercing Ammo and Stone Walls.
+* **UDP `:34199` -> `factorio/world-railworld` (`[Substrate #3] Rail World Express`)**: `--preset rail-world` with colossal 600% size & richness distant ore patches and a starter depot with 1,000 Rails, 5 Locomotives, and 10 Cargo Wagons.
+* **UDP `:34200` -> `factorio/world-ribbonworld` (`[Substrate #4] Ribbon World 64-Tile Strip`)**: `--preset ribbon-world` with `height: 64` (a narrow 64-tile tall horizontal strip where the black map void is visible at the top and bottom of your screen!) and 600% rich ores.
+
+Even though all four Actors start from the **same** pre-warmed `factorio/factorio-server` Golden Snapshot, each Actor generates its own distinct custom world on **first connect**: `factorio-sidecar` defers reading `/run/ate/actor-name` until the first `/ws` connection after `RestoreWorkload` (avoiding gVisor `FileAccess: exclusive` dentry caching during Golden Snapshot creation) and serves the Actor-specific `server-settings.json`, `map-gen-settings.json`, and `--preset` over a local loopback TCP control socket (`127.0.0.1:27016`) while coalescing incoming UDP `ConnectionRequest` retries until map generation finishes!
 
 When `world-vanilla` is running on the single worker pod (with zero active players) and someone connects to `:34198` (`world-deathworld`), look at what `factorio-gateway` does automatically:
 1. Calls `/prepare-suspend` on `world-vanilla`'s sidecar, which connects to Factorio's local RCON port (`127.0.0.1:27015`) and executes `/server-save`.

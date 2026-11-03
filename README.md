@@ -42,12 +42,14 @@ Factorio Client (UDP :34197 Vanilla / :34198 Deathworld)
 
 ### Multi-World Multiplexing on a Single Warm Worker
 By default, we deploy:
-- **1 warm `WorkerPool` pod** (`factorio-pool`, `replicas: 1`)
-- **2 Factorio `Actor` worlds**:
-  - `factorio/world-vanilla` (exposed on LoadBalancer UDP `:34197`)
-  - `factorio/world-deathworld` (exposed on LoadBalancer UDP `:34198`)
+- **1 warm `WorkerPool` pod** (`factorio`, `replicas: 1`)
+- **4 distinct Factorio `Actor` worlds**, each generating its own custom map preset, super-dense resource settings (`map-gen-settings.json`), server name/description, charted map tags, and starter kit chest on first connect:
+  1. `factorio/world-vanilla` (`:34197/UDP`) — **`[Substrate #1] Super-Dense Megabase (600% Rich Ores)`**: `--preset rich-resources` with 600% richness (`richness: 6, size: 4, frequency: 2`), peaceful mode, huge starting area (`3x`), zero cliffs, and a starter chest with Power Armor, Exoskeletons, Roboports, and Express Belts.
+  2. `factorio/world-deathworld` (`:34198/UDP`) — **`[Substrate #2] Deathworld Biter Swarm (400% Enemy Bases)`**: `--preset death-world` with 400% biter nest frequency & size (`frequency: 4, size: 4, richness: 4`), small starting area (`0.75x`), 400% rich ores, and a 4-turret armed perimeter bunker at spawn stocked with Piercing Ammo and Stone Walls.
+  3. `factorio/world-railworld` (`:34199/UDP`) — **`[Substrate #3] Rail World Express (Giant Outpost Patches)`**: `--preset rail-world` with colossal 600% size & richness distant ore patches (`frequency: 0.25, size: 6, richness: 6`), biter expansion disabled, zero cliffs, and a starter depot with 1,000 Rails, 5 Locomotives, 10 Cargo Wagons, and Rocket Fuel.
+  4. `factorio/world-ribbonworld` (`:34200/UDP`) — **`[Substrate #4] Ribbon World 64-Tile Strip (600% Rich)`**: `--preset ribbon-world` with `height: 64` (a narrow 64-tile tall horizontal strip where the black map void is visible at the top and bottom of your screen!), 600% rich ores, and a starter chest with 500 Landfill and Fast Belts.
 
-Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198` while `world-vanilla` is idle automatically triggers an RCON `/server-save` on `world-vanilla`, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores `world-deathworld` into the exact same worker pod!
+Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198`, `:34199`, or `:34200` while another world is idle automatically triggers an RCON `/server-save` on the active world, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores the requested world into the exact same worker pod in ~1.4 seconds!
 
 ### Automatic Zero-Touch Factorio Version Upgrades (Proactive + Reactive)
 Because Steam auto-updates players' Factorio clients whenever Wube releases a new `stable` patch, `factorio-gateway` implements a **dual auto-upgrade system**:
@@ -154,7 +156,14 @@ kubectl -n factorio get svc factorio-gateway
 ```
 
 In the Factorio 2.1.x game client (**Multiplayer -> Connect to address**):
-- **Vanilla World:** `<EXTERNAL-IP>:34197` (walk to `(0.5, 0.5)` at spawn to see the `steel-chest` containing `42` `automation-science-pack`s!)
-- **Deathworld:** `<EXTERNAL-IP>:34198`
+- **World #1 — Super-Dense Megabase (600% Rich Ores, Peaceful, No Cliffs):** `<EXTERNAL-IP>:34197`
+- **World #2 — Deathworld Biter Swarm (400% Enemy Bases, Armed Spawn Bunker):** `<EXTERNAL-IP>:34198`
+- **World #3 — Rail World Express (Giant 600% Outpost Patches, Train Depot Chest):** `<EXTERNAL-IP>:34199`
+- **World #4 — Ribbon World 64-Tile Strip (64-Tile Tall Horizontal World, 600% Ores):** `<EXTERNAL-IP>:34200`
+
+To reset all 4 worlds so they generate brand-new custom maps on next connect:
+```bash
+RESET_WORLDS=true ./hack/deploy.sh
+```
 
 *(Note: If the world is currently suspended, the first connection attempt triggers `ResumeActor` in the background; if a cold restore or version migration takes longer than the client's retry window, simply click **Connect** a second time once the world is awake.)*
