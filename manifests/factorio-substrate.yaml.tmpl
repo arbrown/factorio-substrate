@@ -17,6 +17,36 @@ kind: Namespace
 metadata:
   name: factorio
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: factorio-gateway
+  namespace: factorio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: factorio-gateway-workerpool-scaler
+  namespace: factorio
+rules:
+- apiGroups: ["ate.dev"]
+  resources: ["workerpools"]
+  verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: factorio-gateway-workerpool-scaler
+  namespace: factorio
+subjects:
+- kind: ServiceAccount
+  name: factorio-gateway
+  namespace: factorio
+roleRef:
+  kind: Role
+  name: factorio-gateway-workerpool-scaler
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
 metadata:
@@ -24,14 +54,22 @@ metadata:
   namespace: factorio
   labels:
     workload: factorio
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
 spec:
-  # Single physical warm worker pod that multiplexes all 4 Factorio worlds
+  # Single physical worker pod that multiplexes all 4 Factorio worlds
   # (world-vanilla, world-deathworld, world-railworld, world-ribbonworld) on demand.
+  # Automatically scaled 0 -> 1 on inbound UDP traffic and 1 -> 0 after idle timeout.
   replicas: 1
   workerImage: ${WORKER_IMAGE}
   template:
     nodeSelector:
       ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    tolerations:
+    - key: "ate.dev/sandboxClass"
+      operator: "Equal"
+      value: "gvisor"
+      effect: "NoSchedule"
     resources:
       limits:
         cpu: "2"
@@ -49,6 +87,8 @@ metadata:
     app: factorio-gateway
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: factorio-gateway
@@ -57,15 +97,22 @@ spec:
       labels:
         app: factorio-gateway
     spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: control-pool
+      serviceAccountName: factorio-gateway
       containers:
       - name: gateway
         image: ko://github.com/arbrown/factorio-substrate/cmd/factorio-gateway
         args:
-        - "--routes=34197=factorio/world-vanilla,34198=factorio/world-deathworld,34199=factorio/world-railworld,34200=factorio/world-ribbonworld"
+        - "--routes=${ROUTES_ARG}"
         - "--idle-timeout=${IDLE_TIMEOUT}"
         - "--ws-rotate-interval=4m"
         - "--preempt-idle-grace=5s"
         - "--max-active-worlds=1"
+        - "--workerpool-namespace=factorio"
+        - "--workerpool-name=factorio"
+        - "--workerpool-idle-timeout=${WORKERPOOL_IDLE_TIMEOUT}"
+        - "--resume-timeout=5m"
         - "--router-http-addr=atenet-router.ate-system.svc.cluster.local:80"
         - "--ateapi-address=api.ate-system.svc.cluster.local:443"
         - "--ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem"
@@ -77,18 +124,7 @@ spec:
         - "--upstream-repo=factoriotools/factorio"
         - "--upstream-tag=stable"
         ports:
-        - name: udp-vanilla
-          containerPort: 34197
-          protocol: UDP
-        - name: udp-deathworld
-          containerPort: 34198
-          protocol: UDP
-        - name: udp-railworld
-          containerPort: 34199
-          protocol: UDP
-        - name: udp-ribbonworld
-          containerPort: 34200
-          protocol: UDP
+${GATEWAY_UDP_PORTS}
         - name: http-status
           containerPort: 8080
           protocol: TCP
@@ -106,7 +142,7 @@ spec:
           periodSeconds: 10
         resources:
           requests:
-            cpu: 50m
+            cpu: 10m
             memory: 64Mi
           limits:
             cpu: 500m
@@ -135,33 +171,6 @@ spec:
                 matchLabels:
                   podcert.ate.dev/canarying: live
               path: trust-bundle.pem
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: factorio-gateway
-  namespace: factorio
-spec:
-  type: LoadBalancer
-  selector:
-    app: factorio-gateway
-  ports:
-  - name: factorio-vanilla
-    port: 34197
-    targetPort: 34197
-    protocol: UDP
-  - name: factorio-deathworld
-    port: 34198
-    targetPort: 34198
-    protocol: UDP
-  - name: factorio-railworld
-    port: 34199
-    targetPort: 34199
-    protocol: UDP
-  - name: factorio-ribbonworld
-    port: 34200
-    targetPort: 34200
-    protocol: UDP
 ---
 apiVersion: v1
 kind: Service

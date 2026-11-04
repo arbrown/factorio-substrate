@@ -11,3 +11,6 @@ dist/
 *.test
 *.out
 coverage.txt
+
+# Local cost estimates (do not publish)
+COST_ESTIMATES.md

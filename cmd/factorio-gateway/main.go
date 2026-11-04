@@ -60,6 +60,157 @@ type ActorSuspender interface {
 	SuspendActor(ctx context.Context, atespace, name string) error
 }
 
+// WorkerPoolStatus describes the spec and ready replica counts for a WorkerPool.
+type WorkerPoolStatus struct {
+	SpecReplicas  int32 `json:"spec_replicas"`
+	ReadyReplicas int32 `json:"ready_replicas"`
+}
+
+// WorkerPoolScaler scales the underlying Kubernetes WorkerPool CR on demand
+// (e.g. 0 -> 1 on inbound Factorio UDP traffic, 1 -> 0 after all worlds are idle).
+type WorkerPoolScaler interface {
+	GetWorkerPoolStatus(ctx context.Context, namespace, name string) (WorkerPoolStatus, error)
+	SetWorkerPoolReplicas(ctx context.Context, namespace, name string, replicas int32) (WorkerPoolStatus, error)
+}
+
+type k8sWorkerPoolScaler struct {
+	baseURL    string
+	tokenPath  string
+	httpClient *http.Client
+}
+
+func newInClusterWorkerPoolScaler() (WorkerPoolScaler, error) {
+	host := os.Getenv("KUBERNETES_SERVICE_HOST")
+	port := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if host == "" || port == "" {
+		return nil, nil
+	}
+	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read k8s ca %q: %w", caPath, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certs found in k8s ca %q", caPath)
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs: pool,
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	return &k8sWorkerPoolScaler{
+		baseURL:    fmt.Sprintf("https://%s:%s", host, port),
+		tokenPath:  tokenPath,
+		httpClient: client,
+	}, nil
+}
+
+func (s *k8sWorkerPoolScaler) getToken() (string, error) {
+	tokenBytes, err := os.ReadFile(s.tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("read k8s serviceaccount token %q: %w", s.tokenPath, err)
+	}
+	return strings.TrimSpace(string(tokenBytes)), nil
+}
+
+func (s *k8sWorkerPoolScaler) GetWorkerPoolStatus(ctx context.Context, namespace, name string) (WorkerPoolStatus, error) {
+	token, err := s.getToken()
+	if err != nil {
+		return WorkerPoolStatus{}, err
+	}
+	u := fmt.Sprintf("%s/apis/ate.dev/v1alpha1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return WorkerPoolStatus{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return WorkerPoolStatus{}, fmt.Errorf("get workerpool %s/%s: %w", namespace, name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return WorkerPoolStatus{}, fmt.Errorf("get workerpool %s/%s status %d: %s", namespace, name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Spec struct {
+			Replicas int32 `json:"replicas"`
+		} `json:"spec"`
+		Status struct {
+			ReadyReplicas int32 `json:"readyReplicas"`
+			Replicas      int32 `json:"replicas"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return WorkerPoolStatus{}, fmt.Errorf("decode workerpool response: %w", err)
+	}
+
+	return WorkerPoolStatus{
+		SpecReplicas:  payload.Spec.Replicas,
+		ReadyReplicas: payload.Status.ReadyReplicas,
+	}, nil
+}
+
+func (s *k8sWorkerPoolScaler) SetWorkerPoolReplicas(ctx context.Context, namespace, name string, replicas int32) (WorkerPoolStatus, error) {
+	token, err := s.getToken()
+	if err != nil {
+		return WorkerPoolStatus{}, err
+	}
+	u := fmt.Sprintf("%s/apis/ate.dev/v1alpha1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	patchBody := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u, strings.NewReader(patchBody))
+	if err != nil {
+		return WorkerPoolStatus{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return WorkerPoolStatus{}, fmt.Errorf("patch workerpool %s/%s: %w", namespace, name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return WorkerPoolStatus{}, fmt.Errorf("patch workerpool %s/%s status %d: %s", namespace, name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Spec struct {
+			Replicas int32 `json:"replicas"`
+		} `json:"spec"`
+		Status struct {
+			ReadyReplicas int32 `json:"readyReplicas"`
+			Replicas      int32 `json:"replicas"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return WorkerPoolStatus{}, fmt.Errorf("decode workerpool patch response: %w", err)
+	}
+
+	return WorkerPoolStatus{
+		SpecReplicas:  payload.Spec.Replicas,
+		ReadyReplicas: payload.Status.ReadyReplicas,
+	}, nil
+}
+
 // TemplateSnapshotInfo describes the current state of an ActorTemplate in
 // Agent Substrate.
 type TemplateSnapshotInfo struct {
@@ -349,6 +500,13 @@ type GatewayConfig struct {
 	UpstreamTag       string
 	ImagePollInterval time.Duration
 	Registry          RegistryClient
+
+	// Scale-to-Zero WorkerPool lifecycle settings.
+	WorkerPoolNamespace   string
+	WorkerPoolName        string
+	WorkerPoolIdleTimeout time.Duration
+	ResumeTimeout         time.Duration
+	Scaler                WorkerPoolScaler
 }
 
 type WorldTunnel struct {
@@ -382,10 +540,12 @@ type Gateway struct {
 	suspender ActorSuspender
 	tmplMgr   TemplateManager
 	registry  RegistryClient
+	scaler    WorkerPoolScaler
 	worlds    map[string]*WorldTunnel // keyed by ActorRef ("atespace/actor")
 	byPort    map[int]*WorldTunnel
 	preemptMu sync.Mutex
 	upgradeMu sync.Mutex
+	scaleMu   sync.Mutex
 
 	metaMu             sync.Mutex
 	templateInfo       TemplateSnapshotInfo
@@ -397,6 +557,14 @@ type Gateway struct {
 	lastUpgradeReason  string
 	lastUpdateError    string
 	upgradeCount       atomic.Uint64
+
+	upgradeInProgress atomic.Bool
+	workerPoolStatus  WorkerPoolStatus
+	lastScaleCheck    time.Time
+	lastScaleTime     time.Time
+	lastScaleReason   string
+	scaleUpCount      atomic.Uint64
+	scaleDownCount    atomic.Uint64
 }
 
 func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
@@ -424,6 +592,18 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 	if cfg.UpstreamTag == "" {
 		cfg.UpstreamTag = "stable"
 	}
+	if cfg.WorkerPoolNamespace == "" {
+		cfg.WorkerPoolNamespace = "factorio"
+	}
+	if cfg.WorkerPoolName == "" {
+		cfg.WorkerPoolName = "factorio"
+	}
+	if cfg.WorkerPoolIdleTimeout <= 0 {
+		cfg.WorkerPoolIdleTimeout = 2 * time.Minute
+	}
+	if cfg.ResumeTimeout <= 0 {
+		cfg.ResumeTimeout = 5 * time.Minute
+	}
 	var tmplMgr TemplateManager
 	if tm, ok := suspender.(TemplateManager); ok {
 		tmplMgr = tm
@@ -437,6 +617,7 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 		suspender: suspender,
 		tmplMgr:   tmplMgr,
 		registry:  reg,
+		scaler:    cfg.Scaler,
 		worlds:    make(map[string]*WorldTunnel, len(cfg.Routes)),
 		byPort:    make(map[int]*WorldTunnel, len(cfg.Routes)),
 	}
@@ -616,6 +797,9 @@ func (wt *WorldTunnel) shouldWakeLocked(clientKey string, pkt []byte, now time.T
 }
 
 func (wt *WorldTunnel) activateWorld(ctx context.Context) {
+	// Ensure the underlying WorkerPool is scaled up from 0 to 1 so a worker pod can schedule.
+	wt.gw.ensureWorkerPoolScaledUp(ctx, "wake-"+wt.spec.Actor)
+
 	// If the WorkerPool is full (e.g. 1 replica) and another world is currently
 	// running or resuming without active player traffic, suspend it first so
 	// this world can claim the worker pod.
@@ -633,6 +817,80 @@ func (wt *WorldTunnel) activateWorld(ctx context.Context) {
 	wt.mu.Unlock()
 
 	go wt.maintainWebSocketLoop(tunnelCtx)
+}
+
+func (gw *Gateway) ensureWorkerPoolScaledUp(ctx context.Context, reason string) {
+	if gw.scaler == nil {
+		return
+	}
+	gw.scaleMu.Lock()
+	defer gw.scaleMu.Unlock()
+
+	cur, err := gw.scaler.GetWorkerPoolStatus(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName)
+	if err != nil {
+		slog.Warn("Failed to get WorkerPool status", "namespace", gw.cfg.WorkerPoolNamespace, "name", gw.cfg.WorkerPoolName, "err", err)
+		return
+	}
+	gw.workerPoolStatus = cur
+	gw.lastScaleCheck = time.Now()
+
+	wanted := int32(gw.cfg.MaxActiveWorlds)
+	if cur.SpecReplicas < wanted {
+		slog.Info("Scaling up WorkerPool from 0 -> 1",
+			"namespace", gw.cfg.WorkerPoolNamespace,
+			"name", gw.cfg.WorkerPoolName,
+			"old_spec_replicas", cur.SpecReplicas,
+			"new_spec_replicas", wanted,
+			"reason", reason,
+		)
+		updated, err := gw.scaler.SetWorkerPoolReplicas(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName, wanted)
+		if err != nil {
+			slog.Error("Failed to scale up WorkerPool", "namespace", gw.cfg.WorkerPoolNamespace, "name", gw.cfg.WorkerPoolName, "err", err)
+			return
+		}
+		gw.scaleUpCount.Add(1)
+		gw.workerPoolStatus = updated
+		gw.lastScaleTime = time.Now()
+		gw.lastScaleReason = reason
+	}
+}
+
+func (gw *Gateway) maybeScaleDownWorkerPool(ctx context.Context, now time.Time, suspendedFor time.Duration) {
+	if gw.scaler == nil || gw.cfg.WorkerPoolIdleTimeout <= 0 {
+		return
+	}
+	gw.scaleMu.Lock()
+	defer gw.scaleMu.Unlock()
+
+	if gw.workerPoolStatus.SpecReplicas == 0 && now.Sub(gw.lastScaleCheck) < 10*time.Second {
+		return
+	}
+
+	cur, err := gw.scaler.GetWorkerPoolStatus(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName)
+	if err != nil {
+		slog.Warn("Failed to check WorkerPool status for scale down", "err", err)
+		return
+	}
+	gw.workerPoolStatus = cur
+	gw.lastScaleCheck = now
+
+	if cur.SpecReplicas > 0 {
+		slog.Info("All Factorio worlds suspended for WorkerPool idle timeout; scaling WorkerPool to 0",
+			"namespace", gw.cfg.WorkerPoolNamespace,
+			"name", gw.cfg.WorkerPoolName,
+			"suspended_for", suspendedFor.Round(time.Second),
+			"idle_timeout", gw.cfg.WorkerPoolIdleTimeout,
+		)
+		updated, err := gw.scaler.SetWorkerPoolReplicas(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName, 0)
+		if err != nil {
+			slog.Error("Failed to scale down WorkerPool to 0", "err", err)
+			return
+		}
+		gw.scaleDownCount.Add(1)
+		gw.workerPoolStatus = updated
+		gw.lastScaleTime = now
+		gw.lastScaleReason = fmt.Sprintf("idle-timeout-%s", suspendedFor.Round(time.Second))
+	}
 }
 
 func (gw *Gateway) preemptIdleWorldsFor(ctx context.Context, target *WorldTunnel) {
@@ -679,14 +937,44 @@ func (gw *Gateway) preemptIdleWorldsFor(ctx context.Context, target *WorldTunnel
 }
 
 func (wt *WorldTunnel) maintainWebSocketLoop(ctx context.Context) {
+	resumeStart := time.Now()
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		startDial := time.Now()
+		wt.mu.Lock()
+		st := wt.state
+		wt.mu.Unlock()
+		if st == WorldStateResuming && time.Since(resumeStart) > wt.gw.cfg.ResumeTimeout {
+			slog.Error("Timed out waiting for Actor to resume via atenet-router",
+				"actor", wt.spec.ActorRef(),
+				"timeout", wt.gw.cfg.ResumeTimeout,
+			)
+			wt.mu.Lock()
+			wt.state = WorldStateSuspended
+			wt.lastStateChange = time.Now()
+			wt.mu.Unlock()
+			return
+		}
+
 		ws, err := wt.dialActorWebSocket(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			wt.mu.Lock()
+			st := wt.state
+			wt.mu.Unlock()
+			if st == WorldStateResuming && time.Since(resumeStart) > wt.gw.cfg.ResumeTimeout {
+				slog.Error("Timed out waiting for Actor to resume via atenet-router after dial error",
+					"actor", wt.spec.ActorRef(),
+					"err", err,
+					"timeout", wt.gw.cfg.ResumeTimeout,
+				)
+				wt.mu.Lock()
+				wt.state = WorldStateSuspended
+				wt.lastStateChange = time.Now()
+				wt.mu.Unlock()
 				return
 			}
 			slog.Warn("Dialing Actor WebSocket via atenet-router failed; retrying",
@@ -705,12 +993,10 @@ func (wt *WorldTunnel) maintainWebSocketLoop(ctx context.Context) {
 		wt.mu.Lock()
 		wasResuming := wt.state == WorldStateResuming
 		if wasResuming {
-			wt.lastResumeLatency = now.Sub(startDial)
+			wt.lastResumeLatency = now.Sub(resumeStart)
 			wt.state = WorldStateRunning
 			wt.lastStateChange = now
-			if wt.lastOutboundReply.IsZero() {
-				wt.lastOutboundReply = now
-			}
+			wt.lastOutboundReply = now // Unconditionally reset so the world has a fresh idle timeout window!
 			slog.Info("Factorio Actor resumed and WebSocket tunnel established",
 				"actor", wt.spec.ActorRef(),
 				"resume_latency", wt.lastResumeLatency.Round(time.Millisecond),
@@ -718,11 +1004,14 @@ func (wt *WorldTunnel) maintainWebSocketLoop(ctx context.Context) {
 		}
 		wt.ws = ws
 
-		// Flush any buffered client handshake packets immediately.
+		// Flush buffered client handshake packets if fresh (within 15s).
+		// Older packets from before cold node boot have stale sequence numbers.
 		for clientKey, pkt := range wt.pendingByClient {
-			if frame, err := tunnelproto.EncodeFrame(clientKey, pkt); err == nil {
-				_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_ = ws.WriteMessage(websocket.BinaryMessage, frame)
+			if now.Sub(wt.lastInbound) <= 15*time.Second {
+				if frame, err := tunnelproto.EncodeFrame(clientKey, pkt); err == nil {
+					_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					_ = ws.WriteMessage(websocket.BinaryMessage, frame)
+				}
 			}
 			delete(wt.pendingByClient, clientKey)
 		}
@@ -735,7 +1024,7 @@ func (wt *WorldTunnel) maintainWebSocketLoop(ctx context.Context) {
 		if wt.ws == ws {
 			wt.ws = nil
 		}
-		st := wt.state
+		st = wt.state
 		wt.mu.Unlock()
 		_ = ws.Close()
 
@@ -1030,6 +1319,12 @@ func (gw *Gateway) CheckAndUpgradeTemplate(ctx context.Context, reason string, i
 		}, nil
 	}
 
+	gw.upgradeInProgress.Store(true)
+	defer gw.upgradeInProgress.Store(false)
+
+	// Golden Snapshot building requires a ready WorkerPool pod.
+	gw.ensureWorkerPoolScaledUp(checkCtx, "template-upgrade:"+reason)
+
 	slog.Info("Upgrading Factorio ActorTemplate in-place to new upstream release",
 		"atespace", gw.cfg.TemplateAtespace,
 		"template", gw.cfg.TemplateName,
@@ -1087,25 +1382,60 @@ func (gw *Gateway) idleReaperLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			allSuspended := true
+			var latestSuspendedChange time.Time
+
 			for _, wt := range gw.worlds {
 				wt.mu.Lock()
-				if wt.state != WorldStateRunning {
-					wt.mu.Unlock()
-					continue
-				}
+				st := wt.state
 				lastActivity := wt.lastOutboundReply
 				if lastActivity.IsZero() {
 					lastActivity = wt.lastStateChange
 				}
-				idleDuration := now.Sub(lastActivity)
+				changeTime := wt.lastStateChange
 				wt.mu.Unlock()
 
-				if idleDuration >= gw.cfg.IdleTimeout {
-					slog.Info("No Factorio UDP traffic for idle timeout; suspending Actor",
-						"actor", wt.spec.ActorRef(),
-						"idle_duration", idleDuration.Round(time.Second),
-					)
-					_ = wt.suspendNow(ctx, "idle-timeout")
+				if st == WorldStateRunning {
+					allSuspended = false
+					idleDuration := now.Sub(lastActivity)
+					if idleDuration >= gw.cfg.IdleTimeout {
+						slog.Info("No Factorio UDP traffic for idle timeout; suspending Actor",
+							"actor", wt.spec.ActorRef(),
+							"idle_duration", idleDuration.Round(time.Second),
+						)
+						_ = wt.suspendNow(ctx, "idle-timeout")
+					}
+				} else if st != WorldStateSuspended {
+					allSuspended = false
+				} else {
+					if changeTime.After(latestSuspendedChange) {
+						latestSuspendedChange = changeTime
+					}
+				}
+			}
+
+			if allSuspended && !gw.upgradeInProgress.Load() {
+				// Do not scale down WorkerPool if the ActorTemplate's Golden Snapshot is not ready yet!
+				if gw.tmplMgr != nil {
+					info, err := gw.tmplMgr.GetTemplateInfo(ctx, gw.cfg.TemplateAtespace, gw.cfg.TemplateName)
+					if err == nil && info.SnapshotURI == "" {
+						gw.ensureWorkerPoolScaledUp(ctx, "template-building")
+						continue
+					}
+				}
+
+				gw.metaMu.Lock()
+				lastUpgrade := gw.lastUpgradeTime
+				gw.metaMu.Unlock()
+				if lastUpgrade.After(latestSuspendedChange) {
+					latestSuspendedChange = lastUpgrade
+				}
+				if latestSuspendedChange.IsZero() {
+					latestSuspendedChange = now
+				}
+				suspendedFor := now.Sub(latestSuspendedChange)
+				if suspendedFor >= gw.cfg.WorkerPoolIdleTimeout {
+					gw.maybeScaleDownWorkerPool(ctx, now, suspendedFor)
 				}
 			}
 		}
@@ -1153,6 +1483,7 @@ func (wt *WorldTunnel) suspendNow(ctx context.Context, reason string) error {
 	wt.mu.Lock()
 	wt.state = WorldStateSuspended
 	wt.lastStateChange = time.Now()
+	wt.lastOutboundReply = time.Time{}
 	wt.suspendCount.Add(1)
 	wt.mu.Unlock()
 	return suspendErr
@@ -1191,6 +1522,7 @@ func (gw *Gateway) HTTPHandler() http.Handler {
 	mux.HandleFunc("/status", gw.handleStatus)
 	mux.HandleFunc("/world-status", gw.handleWorldStatus)
 	mux.HandleFunc("/suspend", gw.handleManualSuspend)
+	mux.HandleFunc("/scale", gw.handleManualScale)
 	mux.HandleFunc("/check-update", gw.handleCheckUpdate)
 	return mux
 }
@@ -1291,16 +1623,44 @@ func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		autoUpdate["last_upgrade_time"] = lastUpgrade.UTC().Format(time.RFC3339)
 	}
 
+	gw.scaleMu.Lock()
+	wpStatus := gw.workerPoolStatus
+	lastScaleCheck := gw.lastScaleCheck
+	lastScaleTime := gw.lastScaleTime
+	lastScaleReason := gw.lastScaleReason
+	gw.scaleMu.Unlock()
+
+	workerPoolMap := map[string]any{
+		"namespace":         gw.cfg.WorkerPoolNamespace,
+		"name":              gw.cfg.WorkerPoolName,
+		"spec_replicas":     wpStatus.SpecReplicas,
+		"ready_replicas":    wpStatus.ReadyReplicas,
+		"idle_timeout":      gw.cfg.WorkerPoolIdleTimeout.String(),
+		"resume_timeout":    gw.cfg.ResumeTimeout.String(),
+		"scale_up_count":    gw.scaleUpCount.Load(),
+		"scale_down_count":  gw.scaleDownCount.Load(),
+		"last_scale_reason": lastScaleReason,
+	}
+	if !lastScaleCheck.IsZero() {
+		workerPoolMap["last_scale_check"] = lastScaleCheck.UTC().Format(time.RFC3339)
+	}
+	if !lastScaleTime.IsZero() {
+		workerPoolMap["last_scale_time"] = lastScaleTime.UTC().Format(time.RFC3339)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"idle_timeout":      gw.cfg.IdleTimeout.String(),
 		"max_active_worlds": gw.cfg.MaxActiveWorlds,
 		"auto_update":       autoUpdate,
+		"worker_pool":       workerPoolMap,
 		"worlds":            worlds,
 	})
 }
 
 func (gw *Gateway) handleWorldStatus(w http.ResponseWriter, r *http.Request) {
+	gw.ensureWorkerPoolScaledUp(r.Context(), "world-status-http")
+
 	actorRef := r.URL.Query().Get("actor")
 	if actorRef == "" && len(gw.cfg.Routes) > 0 {
 		actorRef = gw.cfg.Routes[0].ActorRef()
@@ -1344,6 +1704,50 @@ func (gw *Gateway) handleManualSuspend(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"suspended": actorRef})
+}
+
+func (gw *Gateway) handleManualScale(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if gw.scaler == nil {
+		http.Error(w, "WorkerPool scaler not configured", http.StatusServiceUnavailable)
+		return
+	}
+	repStr := r.URL.Query().Get("replicas")
+	if repStr == "" {
+		http.Error(w, "missing 'replicas' query parameter", http.StatusBadRequest)
+		return
+	}
+	rep, err := strconv.Atoi(repStr)
+	if err != nil || rep < 0 || rep > 10 {
+		http.Error(w, "invalid replicas (must be integer between 0 and 10)", http.StatusBadRequest)
+		return
+	}
+
+	gw.scaleMu.Lock()
+	defer gw.scaleMu.Unlock()
+
+	updated, err := gw.scaler.SetWorkerPoolReplicas(r.Context(), gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName, int32(rep))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if int32(rep) > gw.workerPoolStatus.SpecReplicas {
+		gw.scaleUpCount.Add(1)
+	} else if int32(rep) < gw.workerPoolStatus.SpecReplicas {
+		gw.scaleDownCount.Add(1)
+	}
+	gw.workerPoolStatus = updated
+	gw.lastScaleTime = time.Now()
+	gw.lastScaleReason = "manual-http-scale"
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":      "ok",
+		"worker_pool": updated,
+	})
 }
 
 func parseRoutes(raw string) ([]RouteSpec, error) {
@@ -1393,9 +1797,13 @@ func main() {
 		upstreamTag       string
 		imagePollInterval time.Duration
 		ateapiAddr        string
-		ateapiCAFile      string
-		ateapiClientCert  string
-		ateapiServerName  string
+		ateapiCAFile          string
+		ateapiClientCert      string
+		ateapiServerName      string
+		workerpoolNamespace   string
+		workerpoolName        string
+		workerpoolIdleTimeout time.Duration
+		resumeTimeout         time.Duration
 	)
 	flag.StringVar(&routesRaw, "routes", "34197=factorio/world-vanilla,34198=factorio/world-deathworld", "Comma-separated <udpPort>=<atespace>/<actor> routes")
 	flag.StringVar(&udpBindIP, "udp-bind-ip", "0.0.0.0", "IP address to bind UDP listeners on")
@@ -1414,6 +1822,10 @@ func main() {
 	flag.StringVar(&ateapiCAFile, "ateapi-ca-file", "/run/servicedns-ca/trust-bundle.pem", "CA bundle for verifying ate-api-server")
 	flag.StringVar(&ateapiClientCert, "ateapi-client-cert", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "Pod Identity client cert bundle for mTLS to ate-api-server")
 	flag.StringVar(&ateapiServerName, "ateapi-server-name", "api.ate-system.svc", "TLS ServerName for ate-api-server")
+	flag.StringVar(&workerpoolNamespace, "workerpool-namespace", "factorio", "Namespace of the WorkerPool to scale on demand")
+	flag.StringVar(&workerpoolName, "workerpool-name", "factorio", "Name of the WorkerPool to scale on demand")
+	flag.DurationVar(&workerpoolIdleTimeout, "workerpool-idle-timeout", 2*time.Minute, "Duration all Factorio worlds must be suspended before scaling WorkerPool to 0")
+	flag.DurationVar(&resumeTimeout, "resume-timeout", 5*time.Minute, "Maximum time allowed to resume an Actor and establish WebSocket tunnel (covers cold node boot)")
 	flag.Parse()
 
 	routes, err := parseRoutes(routesRaw)
@@ -1429,21 +1841,31 @@ func main() {
 	}
 	defer closeSuspender()
 
+	scaler, err := newInClusterWorkerPoolScaler()
+	if err != nil {
+		slog.Warn("Failed to initialize in-cluster WorkerPool scaler; autoscaling disabled", "err", err)
+	}
+
 	gw := NewGateway(GatewayConfig{
-		UDPBindIP:          udpBindIP,
-		HTTPListenAddr:     httpListenAddr,
-		RouterHTTPAddr:     routerHTTPAddr,
-		Routes:             routes,
-		IdleTimeout:        idleTimeout,
-		WSRotateInterval:   wsRotateInterval,
-		PreemptIdleGrace:   preemptIdleGrace,
-		MaxActiveWorlds:    maxActiveWorlds,
-		RequireFactorioPkt: false,
-		TemplateAtespace:   templateAtespace,
-		TemplateName:       templateName,
-		UpstreamRepo:       upstreamRepo,
-		UpstreamTag:        upstreamTag,
-		ImagePollInterval:  imagePollInterval,
+		UDPBindIP:             udpBindIP,
+		HTTPListenAddr:        httpListenAddr,
+		RouterHTTPAddr:        routerHTTPAddr,
+		Routes:                routes,
+		IdleTimeout:           idleTimeout,
+		WSRotateInterval:      wsRotateInterval,
+		PreemptIdleGrace:      preemptIdleGrace,
+		MaxActiveWorlds:       maxActiveWorlds,
+		RequireFactorioPkt:    false,
+		TemplateAtespace:      templateAtespace,
+		TemplateName:          templateName,
+		UpstreamRepo:          upstreamRepo,
+		UpstreamTag:           upstreamTag,
+		ImagePollInterval:     imagePollInterval,
+		WorkerPoolNamespace:   workerpoolNamespace,
+		WorkerPoolName:        workerpoolName,
+		WorkerPoolIdleTimeout: workerpoolIdleTimeout,
+		ResumeTimeout:         resumeTimeout,
+		Scaler:                scaler,
 	}, suspender)
 
 	ctx, cancel := context.WithCancel(context.Background())

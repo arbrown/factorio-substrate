@@ -11,19 +11,20 @@ See [`TRADEOFFS.md`](TRADEOFFS.md) for a detailed breakdown of the 11 architectu
 ## Architecture Overview
 
 ```
-Factorio Client (UDP :34197 Vanilla / :34198 Deathworld)
+Factorio Client (UDP :34197 Vanilla / :34198 Deathworld / ...)
        │
-       ▼  (GKE LoadBalancer Service, UDP 34197 & 34198)
+       ▼  (GCP VPC Firewall Rule udp:34197-34297 -> Node hostPort)
 ┌──────────────────────────────────────────────────────────┐
-│ factorio-gateway Pod (ate-system namespace, always-on)   │
-│  1. Drops small/malformed internet UDP scanner packets   │
-│  2. If target world is SUSPENDED:                        │
+│ factorio-gateway Pod (Spot control-pool, always-on)     │
+│  1. Listens on dynamic hostPorts for arbitrary maps      │
+│  2. Drops small/malformed internet UDP scanner packets   │
+│  3. If target world is SUSPENDED:                        │
 │     • Preempts & saves any other idle world on the pool  │
 │     • Calls ate.v1alpha1.Actors.ResumeActor (mTLS gRPC)  │
 │     • Buffers initial UDP handshake datagrams            │
-│  3. Opens WebSocket tunnel via atenet-router (:8080/ws)  │
+│  4. Opens WebSocket tunnel via atenet-router (:8080/ws)  │
 │     with header `ate-target-actor: factorio/<world>`     │
-│  4. Tracks bidirectional UDP traffic; after 10m of       │
+│  5. Tracks bidirectional UDP traffic; after 10m of       │
 │     silence, triggers RCON `/server-save` + SuspendActor │
 └──────────────────────────┬───────────────────────────────┘
                            │ WebSocket Frame: [2B addrLen][client IP:port][UDP payload]
@@ -50,6 +51,18 @@ By default, we deploy:
   4. `factorio/world-ribbonworld` (`:34200/UDP`) — **`[Substrate #4] Ribbon World 64-Tile Strip (600% Rich)`**: `--preset ribbon-world` with `height: 64` (a narrow 64-tile tall horizontal strip where the black map void is visible at the top and bottom of your screen!), 600% rich ores, and a starter chest with 500 Landfill and Fast Belts.
 
 Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198`, `:34199`, or `:34200` while another world is idle automatically triggers an RCON `/server-save` on the active world, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores the requested world into the exact same worker pod in ~1.4 seconds!
+
+### Scale-to-Zero Architecture ("Option A" with Spot VMs & hostPort)
+For personal/home use, keeping worker nodes running 24/7 or paying for cloud LoadBalancers is wasteful. We implement **Option A Scale-to-Zero with Spot VMs and hostPort ingress**, minimizing cluster footprint and operational overhead:
+1. **Always-On Spot Control Plane (`control-pool`):** 1x `e2-medium` Spot node (30GB pd-standard). Runs the Substrate control plane (`ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, `podcertificate-controller`), `factorio-gateway`, and `postgres-0` (right-sized from 500Gi to 10Gi).
+2. **On-Demand Spot Worker Node Pool (`substrate-worker-pool`):** `0 -> 1` autoscaling `n2-standard-2` Spot node (Intel Ice Lake, 50GB pd-balanced, tainted `ate.dev/sandboxClass=gvisor:NoSchedule`). Scales down to 0 nodes when idle and provisions on demand.
+3. **Direct `hostPort` Ingress (Arbitrary Maps):** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`factorio-ate-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to `WORLDS` in `hack/deploy.sh` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits.
+4. **Gateway Ingress Cold Wake:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. GKE Cluster Autoscaler provisions the node in ~60–90 seconds while the gateway handles connection retries.
+5. **Automatic Scale-to-Zero:** When all worlds are suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0`. GKE Cluster Autoscaler (`--autoscaling-profile=optimize-utilization`) then shuts down the worker node ~2 minutes later.
+6. **Run Cost Optimization:**
+   ```bash
+   make optimize-cluster   # Runs ./hack/setup-cost-optimized-pools.sh
+   ```
 
 ### Automatic Zero-Touch Factorio Version Upgrades (Proactive + Reactive)
 Because Steam auto-updates players' Factorio clients whenever Wube releases a new `stable` patch, `factorio-gateway` implements a **dual auto-upgrade system**:
@@ -149,10 +162,11 @@ make verify-with-idle
 ```
 
 ### 5. Connect with a Real Factorio Client
-Find the external LoadBalancer IP:
+Find the gateway node's external IP (`hostPort`):
 
 ```bash
-kubectl -n factorio get svc factorio-gateway
+GW_NODE="$(kubectl get pod -n factorio -l app=factorio-gateway -o jsonpath='{.items[0].spec.nodeName}')"
+kubectl get node "${GW_NODE}" -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}'
 ```
 
 In the Factorio 2.1.x game client (**Multiplayer -> Connect to address**):

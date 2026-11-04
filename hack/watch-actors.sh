@@ -60,6 +60,10 @@ else
     echo " Factorio on Agent Substrate — Live Actor & Gateway Watch ($(date +%H:%M:%S))"
     echo "================================================================================"
     echo ""
+    echo "--- GKE Nodes & WorkerPool (Scale-to-Zero) ---"
+    kubectl get nodes -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[-1].type,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool,SPOT:.metadata.labels.cloud\.google\.com/gke-spot,MACHINE:.metadata.labels.node\.kubernetes\.io/instance-type,EXTERNAL-IP:.status.addresses[?(@.type=="ExternalIP")].address' 2>/dev/null || true
+    kubectl get workerpool -n factorio factorio -o custom-columns='NAME:.metadata.name,SPEC_REPLICAS:.spec.replicas,READY_REPLICAS:.status.readyReplicas' 2>/dev/null || true
+    echo ""
     echo "--- Substrate Actors (kubectl-ate get actors -a factorio) ---"
     "${KUBECTL_ATE_BIN}" get actors -a factorio || true
     echo ""

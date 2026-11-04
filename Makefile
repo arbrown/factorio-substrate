@@ -1,7 +1,10 @@
-.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update status clean
+.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update status clean optimize-cluster
 
 test:
 	go test -v -race ./...
+
+optimize-cluster:
+	./hack/setup-cost-optimized-pools.sh
 
 build:
 	mkdir -p bin

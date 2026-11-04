@@ -339,3 +339,182 @@ func TestGatewayProactiveAndReactiveAutoUpgrade(t *testing.T) {
 		t.Fatalf("expected last_client_version=2.1.25 in /status, got %v", got)
 	}
 }
+
+type fakeWorkerPoolScaler struct {
+	mu         sync.Mutex
+	status     WorkerPoolStatus
+	scaleCalls []int32
+}
+
+func (s *fakeWorkerPoolScaler) GetWorkerPoolStatus(_ context.Context, _, _ string) (WorkerPoolStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status, nil
+}
+
+func (s *fakeWorkerPoolScaler) SetWorkerPoolReplicas(_ context.Context, _, _ string, replicas int32) (WorkerPoolStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scaleCalls = append(s.scaleCalls, replicas)
+	s.status.SpecReplicas = replicas
+	s.status.ReadyReplicas = replicas
+	return s.status, nil
+}
+
+func (s *fakeWorkerPoolScaler) calls() []int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int32(nil), s.scaleCalls...)
+}
+
+func TestGatewayWorkerPoolScaleToZeroAndColdWake(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+	routerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/prepare-suspend" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"save_output":"Saved"}`))
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			mt, frame, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			clientAddr, payload, err := tunnelproto.DecodeFrame(frame)
+			if err != nil {
+				continue
+			}
+			replyPayload := append([]byte("echo:"), payload...)
+			replyFrame, _ := tunnelproto.EncodeFrame(clientAddr, replyPayload)
+			_ = ws.WriteMessage(mt, replyFrame)
+		}
+	}))
+	defer routerSrv.Close()
+
+	routerHost := strings.TrimPrefix(routerSrv.URL, "http://")
+	suspender := &fakeSuspender{
+		tmplInfo: TemplateSnapshotInfo{
+			UID:         "uid-test",
+			ImageRef:    "factorio:latest",
+			SnapshotURI: "gs://bucket/golden-test",
+		},
+	}
+	scaler := &fakeWorkerPoolScaler{
+		status: WorkerPoolStatus{SpecReplicas: 0, ReadyReplicas: 0},
+	}
+
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:             "127.0.0.1",
+		RouterHTTPAddr:        routerHost,
+		IdleTimeout:           100 * time.Millisecond,
+		WSRotateInterval:      10 * time.Second,
+		PreemptIdleGrace:      20 * time.Millisecond,
+		MaxActiveWorlds:       1,
+		WorkerPoolNamespace:   "factorio",
+		WorkerPoolName:        "factorio",
+		WorkerPoolIdleTimeout: 150 * time.Millisecond,
+		ResumeTimeout:         3 * time.Second,
+		Scaler:                scaler,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := gw.Start(ctx); err != nil {
+		t.Fatalf("gw.Start failed: %v", err)
+	}
+	defer gw.Close()
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	// 1. Send UDP probe packet while WorkerPool is at 0 replicas; verify it triggers 0 -> 1 scale-up!
+	probe := tunnelproto.BuildFactorioProbePacket(123)
+	_, _ = clientConn.WriteToUDP(probe, vanillaWT.LocalUDPAddr().(*net.UDPAddr))
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	n, _, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("ReadFromUDP failed: %v", err)
+	}
+	if !bytes.HasPrefix(buf[:n], []byte("echo:")) {
+		t.Fatalf("unexpected reply: %q", string(buf[:n]))
+	}
+
+	calls := scaler.calls()
+	if len(calls) == 0 || calls[0] != 1 {
+		t.Fatalf("expected WorkerPool to scale up to 1 replica on UDP traffic, got calls: %v", calls)
+	}
+
+	// 2. Query /status endpoint; verify worker_pool is reported with spec_replicas=1.
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(rec, req)
+	var statusPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &statusPayload); err != nil {
+		t.Fatalf("unmarshal /status failed: %v", err)
+	}
+	wp, _ := statusPayload["worker_pool"].(map[string]any)
+	if wp == nil {
+		t.Fatalf("missing worker_pool in /status response: %v", statusPayload)
+	}
+	if got := wp["spec_replicas"]; got != float64(1) {
+		t.Fatalf("expected spec_replicas=1 in /status, got %v", got)
+	}
+	if got := wp["scale_up_count"]; got != float64(1) {
+		t.Fatalf("expected scale_up_count=1 in /status, got %v", got)
+	}
+
+	// 3. Wait for IdleTimeout (100ms) + WorkerPoolIdleTimeout (150ms).
+	// idleReaperLoop should automatically scale WorkerPool from 1 -> 0!
+	deadline := time.Now().Add(3 * time.Second)
+	scaledDown := false
+	for time.Now().Before(deadline) {
+		calls = scaler.calls()
+		if len(calls) >= 2 && calls[len(calls)-1] == 0 {
+			scaledDown = true
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !scaledDown {
+		t.Fatalf("expected idleReaperLoop to scale down WorkerPool to 0 after idle timeout, got calls: %v", scaler.calls())
+	}
+
+	// 4. Test /scale endpoint: manually scale up to 1, then scale down to 0.
+	scaleUpReq := httptest.NewRequest(http.MethodPost, "/scale?replicas=1", nil)
+	scaleUpRec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(scaleUpRec, scaleUpReq)
+	if scaleUpRec.Code != http.StatusOK {
+		t.Fatalf("/scale?replicas=1 failed: code=%d body=%s", scaleUpRec.Code, scaleUpRec.Body.String())
+	}
+	calls = scaler.calls()
+	if calls[len(calls)-1] != 1 {
+		t.Fatalf("expected /scale?replicas=1 to scale up, got calls: %v", calls)
+	}
+
+	scaleDownReq := httptest.NewRequest(http.MethodPost, "/scale?replicas=0", nil)
+	scaleDownRec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(scaleDownRec, scaleDownReq)
+	if scaleDownRec.Code != http.StatusOK {
+		t.Fatalf("/scale?replicas=0 failed: code=%d body=%s", scaleDownRec.Code, scaleDownRec.Body.String())
+	}
+	calls = scaler.calls()
+	if calls[len(calls)-1] != 0 {
+		t.Fatalf("expected /scale?replicas=0 to scale down, got calls: %v", calls)
+	}
+}

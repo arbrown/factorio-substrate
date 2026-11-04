@@ -54,8 +54,15 @@ trap cleanup EXIT
 
 (cd "${SUBSTRATE_REPO}" && go build -o "${KUBECTL_ATE_BIN}" ./cmd/kubectl-ate)
 
-EXTERNAL_IP="$(kubectl get svc -n factorio factorio-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
-echo "==> External LoadBalancer IP: ${EXTERNAL_IP}"
+GW_NODE="$(kubectl get pod -n factorio -l app=factorio-gateway -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+EXTERNAL_IP=""
+if [[ -n "${GW_NODE}" ]]; then
+  EXTERNAL_IP="$(kubectl get node "${GW_NODE}" -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || true)"
+fi
+if [[ -z "${EXTERNAL_IP}" ]]; then
+  EXTERNAL_IP="$(kubectl get svc -n factorio factorio-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+fi
+echo "==> External Gateway IP: ${EXTERNAL_IP} (node=${GW_NODE:-unknown})"
 
 kubectl port-forward -n factorio svc/factorio-gateway-http 18080:8080 >/dev/null 2>&1 &
 PF_PID=$!

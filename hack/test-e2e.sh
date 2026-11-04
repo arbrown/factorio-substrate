@@ -41,10 +41,16 @@ run_kubectl_ate() {
   (cd "${SUBSTRATE_REPO}" && go run ./cmd/kubectl-ate "$@")
 }
 
-echo "==> Waiting for factorio-gateway External LoadBalancer IP..."
+echo "==> Resolving factorio-gateway External IP (hostPort / Node IP)..."
 EXTERNAL_IP=""
 for i in {1..60}; do
-  EXTERNAL_IP="$(kubectl get svc -n factorio factorio-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  GW_NODE="$(kubectl get pod -n factorio -l app=factorio-gateway -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+  if [[ -n "${GW_NODE}" ]]; then
+    EXTERNAL_IP="$(kubectl get node "${GW_NODE}" -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || true)"
+  fi
+  if [[ -z "${EXTERNAL_IP}" ]]; then
+    EXTERNAL_IP="$(kubectl get svc -n factorio factorio-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  fi
   if [[ -n "${EXTERNAL_IP}" ]]; then
     break
   fi
@@ -54,7 +60,7 @@ if [[ -z "${EXTERNAL_IP}" ]]; then
   echo "error: timed out waiting for factorio-gateway EXTERNAL-IP" >&2
   exit 1
 fi
-echo "    EXTERNAL_IP=${EXTERNAL_IP}"
+echo "    EXTERNAL_IP=${EXTERNAL_IP} (node=${GW_NODE:-unknown})"
 
 echo "==> Starting port-forward to factorio-gateway-http (:18080 -> :8080)..."
 kubectl port-forward -n factorio svc/factorio-gateway-http 18080:8080 >/dev/null 2>&1 &

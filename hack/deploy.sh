@@ -27,7 +27,28 @@ fi
 : "${KO_DOCKER_REPO:?KO_DOCKER_REPO must be set (see .ate-dev-env.sh.example)}"
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-10m}"
-WORLDS=(world-vanilla world-deathworld world-railworld world-ribbonworld)
+WORKERPOOL_IDLE_TIMEOUT="${WORKERPOOL_IDLE_TIMEOUT:-2m}"
+BASE_UDP_PORT="${BASE_UDP_PORT:-34197}"
+if [[ -n "${WORLDS_LIST:-}" ]]; then
+  read -r -a WORLDS <<< "${WORLDS_LIST}"
+else
+  WORLDS=(world-vanilla world-deathworld world-railworld world-ribbonworld)
+fi
+
+ROUTES_ITEMS=()
+GATEWAY_UDP_PORTS=""
+for idx in "${!WORLDS[@]}"; do
+  PORT=$((BASE_UDP_PORT + idx))
+  ACTOR="${WORLDS[$idx]}"
+  ROUTES_ITEMS+=("${PORT}=factorio/${ACTOR}")
+  GATEWAY_UDP_PORTS="${GATEWAY_UDP_PORTS}        - name: udp-port-${PORT}
+          containerPort: ${PORT}
+          hostPort: ${PORT}
+          protocol: UDP
+"
+done
+ROUTES_ARG="$(IFS=,; echo "${ROUTES_ITEMS[*]}")"
+export ROUTES_ARG GATEWAY_UDP_PORTS
 
 KO_BIN="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh --print-bin-path ko)"
 run_ko() {
@@ -50,13 +71,43 @@ echo "==> Building/resolving ateom-gvisor worker image..."
 WORKER_IMAGE="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh ko build ./cmd/ateom-gvisor)"
 echo "    WORKER_IMAGE=${WORKER_IMAGE}"
 
-echo "==> Deploying factorio Namespace, WorkerPool, and UDP Gateway (IDLE_TIMEOUT=${IDLE_TIMEOUT})..."
-sed -e "s|\${SUBSTRATE_VERSION}|${SUBSTRATE_VERSION}|g" \
-    -e "s|\${WORKER_IMAGE}|${WORKER_IMAGE}|g" \
-    -e "s|\${IDLE_TIMEOUT}|${IDLE_TIMEOUT}|g" \
-    manifests/factorio-substrate.yaml.tmpl \
-  | run_ko resolve -f - \
+echo "==> Ensuring GCP Firewall Rule allows UDP hostPorts (34197-34297)..."
+if ! gcloud compute firewall-rules describe factorio-ate-allow-udp-hostport --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "    Creating firewall rule factorio-ate-allow-udp-hostport..."
+  gcloud compute firewall-rules create factorio-ate-allow-udp-hostport \
+    --project="${PROJECT_ID}" \
+    --network=default \
+    --allow=udp:34197-34297 \
+    --source-ranges=0.0.0.0/0 \
+    --description="Allow Factorio UDP traffic to node hostPorts 34197-34297"
+fi
+
+if kubectl get svc -n factorio factorio-gateway >/dev/null 2>&1; then
+  echo "==> Deleting legacy factorio-gateway LoadBalancer Service (using hostPort ingress)..."
+  kubectl delete svc -n factorio factorio-gateway --ignore-not-found
+fi
+
+echo "==> Deploying factorio Namespace, WorkerPool, and UDP Gateway (IDLE_TIMEOUT=${IDLE_TIMEOUT}, WORKERPOOL_IDLE_TIMEOUT=${WORKERPOOL_IDLE_TIMEOUT})..."
+export SUBSTRATE_VERSION WORKER_IMAGE IDLE_TIMEOUT WORKERPOOL_IDLE_TIMEOUT
+python3 -c '
+import os, sys
+tmpl = open("manifests/factorio-substrate.yaml.tmpl").read()
+replacements = {
+    "${SUBSTRATE_VERSION}": os.environ["SUBSTRATE_VERSION"],
+    "${WORKER_IMAGE}": os.environ["WORKER_IMAGE"],
+    "${IDLE_TIMEOUT}": os.environ["IDLE_TIMEOUT"],
+    "${WORKERPOOL_IDLE_TIMEOUT}": os.environ["WORKERPOOL_IDLE_TIMEOUT"],
+    "${ROUTES_ARG}": os.environ["ROUTES_ARG"],
+    "${GATEWAY_UDP_PORTS}": os.environ["GATEWAY_UDP_PORTS"].rstrip(),
+}
+for k, v in replacements.items():
+    tmpl = tmpl.replace(k, v)
+sys.stdout.write(tmpl)
+' | run_ko resolve -f - \
   | kubectl apply -f -
+
+echo "==> Ensuring WorkerPool has 1 replica during deployment..."
+kubectl patch workerpool factorio -n factorio --type=merge -p '{"spec":{"replicas":1}}' || true
 
 echo "==> Waiting for WorkerPool and UDP Gateway to roll out..."
 kubectl wait --for=create deployment/factorio -n factorio --timeout=120s
@@ -147,5 +198,21 @@ done
 echo "==> Current Actors in 'factorio' atespace:"
 run_kubectl_ate get actor -a factorio
 
-echo "==> Factorio Gateway LoadBalancer Service:"
-kubectl get svc -n factorio factorio-gateway
+GW_NODE="$(kubectl get pod -n factorio -l app=factorio-gateway -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+EXTERNAL_IP=""
+if [[ -n "${GW_NODE}" ]]; then
+  EXTERNAL_IP="$(kubectl get node "${GW_NODE}" -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || true)"
+fi
+
+echo "================================================================================"
+echo " Factorio on Agent Substrate Deployed (Spot Nodes + hostPort Ingress)!"
+echo " Gateway Node:        ${GW_NODE:-<pending>}"
+echo " External Host IP:    ${EXTERNAL_IP:-<pending>}"
+echo ""
+echo " Active World Routes (UDP hostPorts):"
+for idx in "${!WORLDS[@]}"; do
+  PORT=$((BASE_UDP_PORT + idx))
+  ACTOR="${WORLDS[$idx]}"
+  echo "   - ${EXTERNAL_IP:-<NODE_IP>}:${PORT}  ==>  factorio/${ACTOR}"
+done
+echo "================================================================================"

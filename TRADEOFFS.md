@@ -26,11 +26,11 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
   - The Substrate ingress router (`atenet-router` running Envoy + `ext_proc`) and the worker-side tunnel (`atunnel`) only route HTTP/1.1, HTTP/2, gRPC, and WebSocket upgrades over TCP.
   - Furthermore, `ateomnet` (`InstallActorNftablesRules` / `actorNonDNSUDPDropRule`) explicitly installs an `nftables` forward-chain rule on the worker pod that **drops all UDP packets originating from the Actor where `dport != 53` (DNS)**.
 * **Our Solution (Unmodified Substrate):**
-  - Rather than forking Substrate's dataplane, we deploy an always-on **`factorio-gateway`** Pod (exposed via a `LoadBalancer` Service on UDP ports `34197`, `34198`, ...) and add a lightweight **`factorio-sidecar`** container alongside `factoriotools/factorio:stable` inside the `ActorTemplate`.
+  - Rather than forking Substrate's dataplane, we deploy an always-on **`factorio-gateway`** Pod on `control-pool` (exposed via direct node **`hostPort`s** on UDP ports `34197`, `34198`, ... with a GCP VPC firewall rule for `udp:34197-34297`) and add a lightweight **`factorio-sidecar`** container alongside `factoriotools/factorio:stable` inside the `ActorTemplate`.
   - The Gateway encapsulates raw player UDP datagrams (preserving client `IP:port`) into WebSocket binary frames and sends them through `atenet-router` with header `ate-target-actor: <atespace>/<actor>`.
   - Inside the Actor sandbox, `factorio-sidecar` receives the WebSocket frames on TCP `:80` and forwards them as real UDP packets over loopback (`127.0.0.1:34197`) to the Factorio server, maintaining a dedicated local ephemeral UDP socket per player `IP:port`. Because loopback traffic never leaves the Actor's network namespace, it bypasses `ateom0` and `nftables` completely.
 * **Side Effect (Server Browser Visibility):**
-  - Because `actorNonDNSUDPDropRule` drops outbound UDP to non-DNS ports, Factorio's UDP heartbeats to `pingpong*.factorio.com` cannot egress. We set `"visibility": {"public": false, "lan": false}` in `server-settings.json` and connect directly via the Gateway's external `LoadBalancer` IP:port.
+  - Because `actorNonDNSUDPDropRule` drops outbound UDP to non-DNS ports, Factorio's UDP heartbeats to `pingpong*.factorio.com` cannot egress. We set `"visibility": {"public": false, "lan": false}` in `server-settings.json` and connect directly via the Gateway node's external `hostPort` IP:port.
 
 ### Trade-off 2: Envoy's 5-Minute Route Timeout (`--route-timeout`)
 * **The Constraint:**
@@ -62,7 +62,7 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
 
 ### Trade-off 6: Cost & Infrastructure Reality (GKE Autopilot + Spot vs. GKE Standard + Warm WorkerPool)
 * **The Constraint:**
-  - The original blog post used **GKE Autopilot + Spot VMs** and scaled the Deployment to `0` when idle, costing $0/hr in compute while off (at the cost of a 2–4 minute cold start when scaling back up).
+  - The original blog post used **GKE Autopilot + Spot VMs** and scaled the Deployment to `0` when idle, incurring no compute cost while off (at the cost of a 2–4 minute cold start when scaling back up).
   - Agent Substrate requires **GKE Standard** (for `atelet` privileged host operations, `gVisor` `runsc` management, `nftables`/netns setup, and K8s `podcertificaterequests` / `clustertrustbundles` APIs) and expressly warns against Spot VMs on `WorkerPool` nodes because an evicted worker pod that isn't suspended within 30 minutes puts the Actor into terminal `ACTOR_STATE_CRASHED`.
   - Furthermore, a warm `WorkerPool` with `replicas: 1` still keeps 1 physical worker pod running in the cluster even when all Actors are `SUSPENDED`.
 * **Why Substrate Makes Sense Here:**
@@ -113,4 +113,38 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
   1. **Zero `/run/ate` Reads During `ate-golden`:** `factorio-sidecar` maintains an `activated` atomic flag that remains `false` during `ate-golden` (when `ateom-gvisor` only polls `GET /readyz`) and flips to `true` only on the first real Actor request (`/ws`, `/status`, or `/prepare-suspend`) after `RestoreWorkload`. Because `/run/ate/actor-name` is never opened during `ate-golden`, its first open after `RestoreWorkload` is guaranteed to fetch the live Actor name (`world-vanilla`, `world-deathworld`, `world-railworld`, or `world-ribbonworld`) fresh from the host gofer.
   2. **Bash `/dev/tcp` Loopback Control Channel (`127.0.0.1:27016`):** Because `factoriotools/factorio:stable` does not include `curl` or `wget` and only the `factorio` container mounts `/factorio` (`durableDir`), `factorio-sidecar` exposes a lightweight line-based TCP control listener on `127.0.0.1:27016` that the `factorio` container queries using built-in `/bin/bash` `/dev/tcp/127.0.0.1/27016`.
   3. **First-Connect Custom World Generation & UDP Coalescing:** When an Actor wakes from the Golden Snapshot on its very first connect, `factorio-sidecar` sets `activated = true` and coalesces incoming player `ConnectionRequest` retry packets per `clientAddr` in memory while the `factorio` container stops the placeholder golden server, fetches the Actor-specific `server-settings.json`, `map-gen-settings.json`, and `--preset` from `127.0.0.1:27016`, runs `--create /factorio/saves/_autosave1.zip --preset <preset> --map-gen-settings /factorio/config/map-gen-settings.json`, and boots Factorio on the new map. Once `factorio-sidecar` seeds the new world's map tags and starter chest via RCON (`initWorldViaRCON`), it flushes the freshest `ConnectionRequest` packet to `127.0.0.1:34197`. On all subsequent connects after that world is suspended to GCS, `SAVED_ACTOR == TARGET_ACTOR`, so the world resumes in ~1.4s with zero map-generation overhead.
+
+### Trade-off 13: Scale-to-Zero Worker Nodes ("Option A" with Spot VMs) vs. Cold Boot Friction
+* **The Constraint:**
+  - Running a warm worker node (`c3-standard-4` or `n2-standard-2`) 24/7 consumes significant baseline compute resources even when no one is playing.
+  - Factorio's game client times out its initial connection handshake after ~15–20 seconds if no reply is received.
+  - Provisioning a cold GKE worker node, pulling DaemonSet images, starting `atelet`, and registering the `WorkerPool` pod takes ~60–90 seconds.
+* **Our Solution (Option A Architecture):**
+  - **Two-Tier Spot Node Pool Design:**
+    1. **Always-On Spot Control Plane (`control-pool`):** Single `e2-medium` Spot node (30GB pd-standard). Hosts `factorio-gateway`, `postgres-0` (right-sized from 500Gi to 10Gi), `ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, and `podcertificate-controller`.
+    2. **On-Demand Spot Worker Pool (`substrate-worker-pool`):** `0 -> 1` autoscaling `n2-standard-2` Spot node with `--min-cpu-platform="Intel Ice Lake"` (ensuring CPUID consistency across gVisor checkpoints), tainted with `ate.dev/sandboxClass=gvisor:NoSchedule`. Scaled to 0 nodes when idle and provisions on demand.
+  - **Gateway Ingress Cold Wake:**
+    - On the very first inbound UDP `ConnectionRequest`, `factorio-gateway` calls the in-cluster Kubernetes API to scale `WorkerPool/factorio` `0 -> 1`.
+    - GKE Cluster Autoscaler (`--autoscaling-profile=optimize-utilization`) spins up the worker node in ~60–90 seconds.
+    - While dialing `atenet-router`, the gateway loops with exponential backoff until the worker pod is registered and the WebSocket tunnel is established (up to `--resume-timeout=5m`).
+    - Stale client packets buffered during the initial 15s are pruned to avoid Factorio sequence desync.
+    - Once the WebSocket tunnel opens, `lastOutboundReply` is unconditionally refreshed, granting a full fresh idle timeout window.
+  - **Automatic Scale-to-Zero Reaper:**
+    - When all Factorio worlds have been suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` patches `WorkerPool/factorio` back to `replicas: 0`.
+    - Because the worker node is tainted `ate.dev/sandboxClass=gvisor:NoSchedule` and `WorkerPool` pods and `atelet` DaemonSet carry `safe-to-evict: "true"`, GKE Cluster Autoscaler detects zero non-DaemonSet pods and safely shuts down the worker VM ~2 minutes later.
+  - **The User Friction Trade-off:**
+    - When cold: The user launches Factorio, connects to `:34197`, waits ~60–90 seconds for the node to provision (or triggers `curl -X POST http://<gateway-ip>:8080/scale?replicas=1` / launches a browser probe), and joins.
+    - Once warm: Multiplexing between all 4 worlds takes only ~1.4 seconds.
+    - When idle: Everything scales to zero automatically with zero manual teardown needed.
+
+### Trade-off 14: Direct `hostPort` Ingress & VPC Firewall Range vs. Cloud LoadBalancer Costs
+* **The Constraint:**
+  - A standard cloud LoadBalancer has per-forwarding-rule limits and charges per rule/port.
+  - Exposing many Factorio worlds (e.g. 10 or 20 maps) would require either multiple LoadBalancer forwarding rules or port range hacks that cloud load balancers do not support smoothly for UDP.
+* **Our Solution:**
+  - We remove `Service/factorio-gateway` (`type: LoadBalancer`) entirely and configure `Deployment/factorio-gateway` with direct **`hostPort`s** pinned to `control-pool` via `nodeSelector: cloud.google.com/gke-nodepool: control-pool`.
+  - To prevent port collision on rollouts on the single control node, the deployment uses `strategy: {type: Recreate}` so the old pod terminates and frees the host ports before the new pod binds them.
+  - We create a single GCP VPC Firewall rule (`factorio-ate-allow-udp-hostport`) allowing port range `udp:34197-34297` (101 ports) directly to nodes.
+  - In `hack/deploy.sh`, adding any number of maps to `WORLDS` dynamically templates their sequential `containerPort` and `hostPort` entries into the pod specification without LoadBalancer rule limits.
+
 
