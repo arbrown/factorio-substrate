@@ -45,9 +45,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/arbrown/factorio-substrate/internal/tunnelproto"
 	"github.com/gorilla/websocket"
+	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -127,7 +127,7 @@ func (s *k8sWorkerPoolScaler) GetWorkerPoolStatus(ctx context.Context, namespace
 	if err != nil {
 		return WorkerPoolStatus{}, err
 	}
-	u := fmt.Sprintf("%s/apis/ate.dev/v1alpha1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	u := fmt.Sprintf("%s/apis/ate.dev/v1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return WorkerPoolStatus{}, err
@@ -170,7 +170,7 @@ func (s *k8sWorkerPoolScaler) SetWorkerPoolReplicas(ctx context.Context, namespa
 	if err != nil {
 		return WorkerPoolStatus{}, err
 	}
-	u := fmt.Sprintf("%s/apis/ate.dev/v1alpha1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	u := fmt.Sprintf("%s/apis/ate.dev/v1/namespaces/%s/workerpools/%s", s.baseURL, url.PathEscape(namespace), url.PathEscape(name))
 	patchBody := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u, strings.NewReader(patchBody))
@@ -316,12 +316,12 @@ func (c *dockerHubRegistryClient) ResolveLatestRelease(ctx context.Context, repo
 }
 
 type grpcActorSuspender struct {
-	client ateapipb.ControlClient
+	client ateapi.ControlClient
 }
 
 func (g *grpcActorSuspender) SuspendActor(ctx context.Context, atespace, name string) error {
-	_, err := g.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-		Actor: &ateapipb.ObjectRef{
+	_, err := g.client.SuspendActor(ctx, &ateapi.SuspendActorRequest{
+		Actor: &ateapi.ObjectRef{
 			Atespace: atespace,
 			Name:     name,
 		},
@@ -330,8 +330,8 @@ func (g *grpcActorSuspender) SuspendActor(ctx context.Context, atespace, name st
 }
 
 func (g *grpcActorSuspender) GetTemplateInfo(ctx context.Context, atespace, templateName string) (TemplateSnapshotInfo, error) {
-	tmpl, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
-		ActorTemplate: &ateapipb.ObjectRef{
+	tmpl, err := g.client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{
+		ActorTemplate: &ateapi.ObjectRef{
 			Atespace: atespace,
 			Name:     templateName,
 		},
@@ -343,8 +343,8 @@ func (g *grpcActorSuspender) GetTemplateInfo(ctx context.Context, atespace, temp
 }
 
 func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace, templateName, newImageRef string) (TemplateSnapshotInfo, error) {
-	tmpl, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
-		ActorTemplate: &ateapipb.ObjectRef{
+	tmpl, err := g.client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{
+		ActorTemplate: &ateapi.ObjectRef{
 			Atespace: atespace,
 			Name:     templateName,
 		},
@@ -364,8 +364,8 @@ func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace,
 		return TemplateSnapshotInfo{}, fmt.Errorf("container 'factorio' not found in ActorTemplate %s/%s", atespace, templateName)
 	}
 
-	if _, err := g.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{
-		ActorTemplate: &ateapipb.ObjectRef{
+	if _, err := g.client.DeleteActorTemplate(ctx, &ateapi.DeleteActorTemplateRequest{
+		ActorTemplate: &ateapi.ObjectRef{
 			Atespace: atespace,
 			Name:     templateName,
 		},
@@ -381,7 +381,7 @@ func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace,
 	}
 	tmpl.Status = nil
 
-	created, err := g.client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+	created, err := g.client.CreateActorTemplate(ctx, &ateapi.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	})
 	if err != nil {
@@ -396,8 +396,8 @@ func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace,
 		case <-ctx.Done():
 			return extractTemplateInfo(created), fmt.Errorf("waiting for Golden Snapshot on %s/%s: %w", atespace, templateName, ctx.Err())
 		case <-ticker.C:
-			cur, err := g.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
-				ActorTemplate: &ateapipb.ObjectRef{
+			cur, err := g.client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{
+				ActorTemplate: &ateapi.ObjectRef{
 					Atespace: atespace,
 					Name:     templateName,
 				},
@@ -409,14 +409,14 @@ func (g *grpcActorSuspender) UpgradeTemplateImage(ctx context.Context, atespace,
 			if errMsg := gs.GetErrorMessage(); errMsg != "" {
 				return extractTemplateInfo(cur), fmt.Errorf("Golden Snapshot failed for %s/%s: %s", atespace, templateName, errMsg)
 			}
-			if uri := gs.GetGoldenSnapshot().GetSnapshotUri(); uri != "" {
+			if tag := gs.GetGoldenTag().GetName(); tag != "" {
 				return extractTemplateInfo(cur), nil
 			}
 		}
 	}
 }
 
-func extractTemplateInfo(tmpl *ateapipb.ActorTemplate) TemplateSnapshotInfo {
+func extractTemplateInfo(tmpl *ateapi.ActorTemplate) TemplateSnapshotInfo {
 	var img string
 	for _, c := range tmpl.GetContainers() {
 		if c.GetName() == "factorio" {
@@ -427,20 +427,20 @@ func extractTemplateInfo(tmpl *ateapipb.ActorTemplate) TemplateSnapshotInfo {
 	return TemplateSnapshotInfo{
 		UID:         tmpl.GetMetadata().GetUid(),
 		ImageRef:    img,
-		SnapshotURI: tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenSnapshot().GetSnapshotUri(),
+		SnapshotURI: tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag().GetName(),
 	}
 }
 
-func newGRPCActorSuspender(address, caFile, clientCertBundle, serverName string) (ActorSuspender, func(), error) {
+func newMTLSTLSConfig(caFile, clientCertBundle, serverName string) (*tls.Config, error) {
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read ateapi CA file %q: %w", caFile, err)
+		return nil, fmt.Errorf("read CA file %q: %w", caFile, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, nil, fmt.Errorf("no certificates found in %q", caFile)
+		return nil, fmt.Errorf("no certificates found in %q", caFile)
 	}
-	tlsCfg := &tls.Config{
+	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		RootCAs:    pool,
 		ServerName: serverName,
@@ -455,12 +455,19 @@ func newGRPCActorSuspender(address, caFile, clientCertBundle, serverName string)
 			}
 			return &cert, nil
 		},
+	}, nil
+}
+
+func newGRPCActorSuspender(address, caFile, clientCertBundle, serverName string) (ActorSuspender, func(), error) {
+	tlsCfg, err := newMTLSTLSConfig(caFile, clientCertBundle, serverName)
+	if err != nil {
+		return nil, nil, err
 	}
 	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial ateapi %q: %w", address, err)
 	}
-	return &grpcActorSuspender{client: ateapipb.NewControlClient(conn)}, func() { _ = conn.Close() }, nil
+	return &grpcActorSuspender{client: ateapi.NewControlClient(conn)}, func() { _ = conn.Close() }, nil
 }
 
 type WorldState string
@@ -485,7 +492,8 @@ func (r RouteSpec) ActorRef() string {
 type GatewayConfig struct {
 	UDPBindIP          string
 	HTTPListenAddr     string
-	RouterHTTPAddr     string // e.g. "atenet-router.ate-system.svc.cluster.local:80"
+	RouterHTTPAddr     string // e.g. "atenet-router.ate-system.svc.cluster.local:443"
+	RouterTLSConfig    *tls.Config
 	Routes             []RouteSpec
 	IdleTimeout        time.Duration
 	WSRotateInterval   time.Duration
@@ -536,12 +544,13 @@ type WorldTunnel struct {
 }
 
 type Gateway struct {
-	cfg       GatewayConfig
-	suspender ActorSuspender
-	tmplMgr   TemplateManager
-	registry  RegistryClient
-	scaler    WorkerPoolScaler
-	worlds    map[string]*WorldTunnel // keyed by ActorRef ("atespace/actor")
+	cfg              GatewayConfig
+	suspender        ActorSuspender
+	tmplMgr          TemplateManager
+	registry         RegistryClient
+	scaler           WorkerPoolScaler
+	routerHTTPClient *http.Client
+	worlds           map[string]*WorldTunnel // keyed by ActorRef ("atespace/actor")
 	byPort    map[int]*WorldTunnel
 	preemptMu sync.Mutex
 	upgradeMu sync.Mutex
@@ -612,14 +621,23 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 	if reg == nil && tmplMgr != nil && cfg.ImagePollInterval > 0 {
 		reg = newDockerHubRegistryClient("")
 	}
+	routerClient := http.DefaultClient
+	if cfg.RouterTLSConfig != nil {
+		routerClient = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: cfg.RouterTLSConfig,
+			},
+		}
+	}
 	gw := &Gateway{
-		cfg:       cfg,
-		suspender: suspender,
-		tmplMgr:   tmplMgr,
-		registry:  reg,
-		scaler:    cfg.Scaler,
-		worlds:    make(map[string]*WorldTunnel, len(cfg.Routes)),
-		byPort:    make(map[int]*WorldTunnel, len(cfg.Routes)),
+		cfg:              cfg,
+		suspender:        suspender,
+		tmplMgr:          tmplMgr,
+		registry:         reg,
+		scaler:           cfg.Scaler,
+		routerHTTPClient: routerClient,
+		worlds:           make(map[string]*WorldTunnel, len(cfg.Routes)),
+		byPort:           make(map[int]*WorldTunnel, len(cfg.Routes)),
 	}
 	for _, r := range cfg.Routes {
 		wt := &WorldTunnel{
@@ -897,42 +915,70 @@ func (gw *Gateway) preemptIdleWorldsFor(ctx context.Context, target *WorldTunnel
 	gw.preemptMu.Lock()
 	defer gw.preemptMu.Unlock()
 
-	active := make([]*WorldTunnel, 0, len(gw.worlds))
-	for _, other := range gw.worlds {
-		if other == target {
-			continue
+	for {
+		active := make([]*WorldTunnel, 0, len(gw.worlds))
+		for _, other := range gw.worlds {
+			if other == target {
+				continue
+			}
+			other.mu.Lock()
+			st := other.state
+			other.mu.Unlock()
+			if st == WorldStateRunning || st == WorldStateResuming {
+				active = append(active, other)
+			}
 		}
-		other.mu.Lock()
-		st := other.state
-		other.mu.Unlock()
-		if st == WorldStateRunning || st == WorldStateResuming {
-			active = append(active, other)
-		}
-	}
 
-	if len(active) < gw.cfg.MaxActiveWorlds {
-		return
-	}
-
-	// Find a world that has had no outbound Factorio UDP replies within PreemptIdleGrace
-	// (or the least-recently active world) and suspend it to free a worker pod.
-	for _, candidate := range active {
-		candidate.mu.Lock()
-		idleFor := time.Since(candidate.lastOutboundReply)
-		if candidate.lastOutboundReply.IsZero() {
-			idleFor = time.Since(candidate.lastStateChange)
-		}
-		candidate.mu.Unlock()
-
-		if idleFor >= gw.cfg.PreemptIdleGrace {
-			slog.Info("Multiplexing WorkerPool: suspending idle world to make room for incoming world",
-				"suspending_actor", candidate.spec.ActorRef(),
-				"waking_actor", target.spec.ActorRef(),
-				"idle_for", idleFor.Round(time.Millisecond),
-			)
-			_ = candidate.suspendNow(ctx, "preempted-for-"+target.spec.Actor)
+		if len(active) < gw.cfg.MaxActiveWorlds {
 			return
 		}
+
+		// Find a world that has had no outbound Factorio UDP replies within PreemptIdleGrace
+		// (or the least-recently active RUNNING world) and suspend it to free a worker pod.
+		var bestGraceCandidate *WorldTunnel
+		var bestGraceIdle time.Duration
+		var oldestRunningCandidate *WorldTunnel
+		var oldestRunningIdle time.Duration
+
+		for _, candidate := range active {
+			candidate.mu.Lock()
+			st := candidate.state
+			idleFor := time.Since(candidate.lastOutboundReply)
+			if candidate.lastOutboundReply.IsZero() {
+				idleFor = time.Since(candidate.lastStateChange)
+			}
+			candidate.mu.Unlock()
+
+			if st != WorldStateRunning {
+				continue
+			}
+			if oldestRunningCandidate == nil || idleFor > oldestRunningIdle {
+				oldestRunningCandidate = candidate
+				oldestRunningIdle = idleFor
+			}
+			if idleFor >= gw.cfg.PreemptIdleGrace {
+				if bestGraceCandidate == nil || idleFor > bestGraceIdle {
+					bestGraceCandidate = candidate
+					bestGraceIdle = idleFor
+				}
+			}
+		}
+
+		victim := bestGraceCandidate
+		victimIdle := bestGraceIdle
+		if victim == nil && oldestRunningCandidate != nil {
+			victim = oldestRunningCandidate
+			victimIdle = oldestRunningIdle
+		}
+		if victim == nil {
+			return
+		}
+		slog.Info("Multiplexing WorkerPool: suspending idle world to make room for incoming world",
+			"suspending_actor", victim.spec.ActorRef(),
+			"waking_actor", target.spec.ActorRef(),
+			"idle_for", victimIdle.Round(time.Millisecond),
+		)
+		_ = victim.suspendNow(ctx, "preempted-for-"+target.spec.Actor)
 	}
 }
 
@@ -1034,12 +1080,26 @@ func (wt *WorldTunnel) maintainWebSocketLoop(ctx context.Context) {
 	}
 }
 
+func (gw *Gateway) routerHTTPScheme() string {
+	if gw.cfg.RouterTLSConfig != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func (gw *Gateway) routerWSScheme() string {
+	if gw.cfg.RouterTLSConfig != nil {
+		return "wss"
+	}
+	return "ws"
+}
+
 func (wt *WorldTunnel) dialActorWebSocket(ctx context.Context) (*websocket.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
 	u := url.URL{
-		Scheme: "ws",
+		Scheme: wt.gw.routerWSScheme(),
 		Host:   wt.gw.cfg.RouterHTTPAddr,
 		Path:   "/ws",
 	}
@@ -1048,6 +1108,7 @@ func (wt *WorldTunnel) dialActorWebSocket(ctx context.Context) (*websocket.Conn,
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 90 * time.Second,
+		TLSClientConfig:  wt.gw.cfg.RouterTLSConfig,
 	}
 	ws, resp, err := dialer.DialContext(dialCtx, u.String(), headers)
 	if err != nil {
@@ -1493,13 +1554,13 @@ func (wt *WorldTunnel) prepareActorSuspend(ctx context.Context) {
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	u := fmt.Sprintf("http://%s/prepare-suspend", wt.gw.cfg.RouterHTTPAddr)
+	u := fmt.Sprintf("%s://%s/prepare-suspend", wt.gw.routerHTTPScheme(), wt.gw.cfg.RouterHTTPAddr)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, nil)
 	if err != nil {
 		return
 	}
 	req.Header.Set(targetActorHeader, wt.spec.ActorRef())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := wt.gw.routerHTTPClient.Do(req)
 	if err != nil {
 		slog.Warn("prepare-suspend call failed", "actor", wt.spec.ActorRef(), "err", err)
 		return
@@ -1666,7 +1727,7 @@ func (gw *Gateway) handleWorldStatus(w http.ResponseWriter, r *http.Request) {
 		actorRef = gw.cfg.Routes[0].ActorRef()
 	}
 	cmd := r.URL.Query().Get("cmd")
-	targetURL := fmt.Sprintf("http://%s/status", gw.cfg.RouterHTTPAddr)
+	targetURL := fmt.Sprintf("%s://%s/status", gw.routerHTTPScheme(), gw.cfg.RouterHTTPAddr)
 	if cmd != "" {
 		targetURL += "?cmd=" + url.QueryEscape(cmd)
 	}
@@ -1676,7 +1737,7 @@ func (gw *Gateway) handleWorldStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set(targetActorHeader, actorRef)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := gw.routerHTTPClient.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1787,6 +1848,8 @@ func main() {
 		udpBindIP         string
 		httpListenAddr    string
 		routerHTTPAddr    string
+		routerTLS         bool
+		routerServerName  string
 		idleTimeout       time.Duration
 		wsRotateInterval  time.Duration
 		preemptIdleGrace  time.Duration
@@ -1808,7 +1871,9 @@ func main() {
 	flag.StringVar(&routesRaw, "routes", "34197=factorio/world-vanilla,34198=factorio/world-deathworld", "Comma-separated <udpPort>=<atespace>/<actor> routes")
 	flag.StringVar(&udpBindIP, "udp-bind-ip", "0.0.0.0", "IP address to bind UDP listeners on")
 	flag.StringVar(&httpListenAddr, "http-listen-addr", ":8080", "HTTP status/health listen address")
-	flag.StringVar(&routerHTTPAddr, "router-http-addr", "atenet-router.ate-system.svc.cluster.local:80", "Substrate atenet-router HTTP address")
+	flag.StringVar(&routerHTTPAddr, "router-http-addr", "atenet-router.ate-system.svc.cluster.local:443", "Substrate atenet-router HTTPS/WSS address")
+	flag.BoolVar(&routerTLS, "router-tls", true, "Use mTLS (HTTPS/WSS) when connecting to atenet-router")
+	flag.StringVar(&routerServerName, "router-server-name", "atenet-router.ate-system.svc", "TLS ServerName for atenet-router")
 	flag.DurationVar(&idleTimeout, "idle-timeout", 10*time.Minute, "Duration of zero Factorio UDP traffic before suspending the Actor")
 	flag.DurationVar(&wsRotateInterval, "ws-rotate-interval", 4*time.Minute, "WebSocket rotation interval (must be < Envoy 5m route-timeout)")
 	flag.DurationVar(&preemptIdleGrace, "preempt-idle-grace", 5*time.Second, "Minimum idle time before a world can be preempted when multiplexing a full WorkerPool")
@@ -1819,8 +1884,8 @@ func main() {
 	flag.StringVar(&upstreamTag, "upstream-tag", "stable", "Docker Hub tag to track for automatic Factorio ActorTemplate upgrades")
 	flag.DurationVar(&imagePollInterval, "image-poll-interval", 30*time.Minute, "Background poll interval for checking Docker Hub when worlds are SUSPENDED (0 to disable)")
 	flag.StringVar(&ateapiAddr, "ateapi-address", "api.ate-system.svc.cluster.local:443", "Substrate Control Plane gRPC address")
-	flag.StringVar(&ateapiCAFile, "ateapi-ca-file", "/run/servicedns-ca/trust-bundle.pem", "CA bundle for verifying ate-api-server")
-	flag.StringVar(&ateapiClientCert, "ateapi-client-cert", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "Pod Identity client cert bundle for mTLS to ate-api-server")
+	flag.StringVar(&ateapiCAFile, "ateapi-ca-file", "/run/servicedns-ca/trust-bundle.pem", "CA bundle for verifying ate-api-server and atenet-router")
+	flag.StringVar(&ateapiClientCert, "ateapi-client-cert", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "Pod Identity client cert bundle for mTLS to ate-api-server and atenet-router")
 	flag.StringVar(&ateapiServerName, "ateapi-server-name", "api.ate-system.svc", "TLS ServerName for ate-api-server")
 	flag.StringVar(&workerpoolNamespace, "workerpool-namespace", "factorio", "Namespace of the WorkerPool to scale on demand")
 	flag.StringVar(&workerpoolName, "workerpool-name", "factorio", "Name of the WorkerPool to scale on demand")
@@ -1841,6 +1906,15 @@ func main() {
 	}
 	defer closeSuspender()
 
+	var routerTLSConfig *tls.Config
+	if routerTLS {
+		routerTLSConfig, err = newMTLSTLSConfig(ateapiCAFile, ateapiClientCert, routerServerName)
+		if err != nil {
+			slog.Error("Failed to initialize atenet-router mTLS config", "err", err)
+			os.Exit(1)
+		}
+	}
+
 	scaler, err := newInClusterWorkerPoolScaler()
 	if err != nil {
 		slog.Warn("Failed to initialize in-cluster WorkerPool scaler; autoscaling disabled", "err", err)
@@ -1850,6 +1924,7 @@ func main() {
 		UDPBindIP:             udpBindIP,
 		HTTPListenAddr:        httpListenAddr,
 		RouterHTTPAddr:        routerHTTPAddr,
+		RouterTLSConfig:       routerTLSConfig,
 		Routes:                routes,
 		IdleTimeout:           idleTimeout,
 		WSRotateInterval:      wsRotateInterval,

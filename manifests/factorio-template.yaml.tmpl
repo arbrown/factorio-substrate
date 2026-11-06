@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for Factorio on
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for Factorio on
 # Agent Substrate. Applied via `kubectl ate create actor-template -f -`.
 metadata:
   atespace: factorio
@@ -33,7 +33,7 @@ containers:
   - "--factorio-dir="
   - "--rcon-password=substrate-factorio-rcon"
   - "--system-info-dir=/run/ate"
-  readyz:
+  wakeupProbe:
     httpGet:
       path: /readyz
       port: 80
@@ -140,7 +140,7 @@ containers:
         wait "${FACTORIO_PID}" 2>/dev/null || true
       fi
     done
-  readyz:
+  wakeupProbe:
     httpGet:
       path: /readyz
       port: 80
@@ -150,17 +150,10 @@ containers:
     mountPath: /factorio
 resources:
   limits:
-  - name: cpu
-    quantity: "2"
-  - name: memory
-    quantity: 4Gi
-snapshotsConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
-  storageLocation: gs://${BUCKET_NAME}/factorio/
-sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
-  configName: gvisor-default
+    cpuMillicores: 2000
+    memoryBytes: 3758096384
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
 volumes:
 - name: factorio-data
   durableDir: {}

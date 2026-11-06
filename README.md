@@ -1,6 +1,6 @@
 # Factorio on Agent Substrate (`factorio-ate`)
 
-Running stateful, UDP-based dedicated game servers (`factoriotools/factorio:stable`) as on-demand, auto-suspending **Agent Substrate (`ate.dev/v1alpha1`) Actors** on GKE, with **multi-world multiplexing** over a single warm `WorkerPool` pod.
+Running stateful, UDP-based dedicated game servers (`factoriotools/factorio:stable`) as on-demand, auto-suspending **Agent Substrate (`ate.dev/v1`) Actors** on GKE, with **multi-world multiplexing** over a single warm `WorkerPool` pod.
 
 This repository is the companion implementation to the follow-up post on [Factorio on GKE with Spot VMs and Auto-Shutdown](https://wasd.drewbrown.me/posts/factorio-gke-spot/).
 
@@ -20,9 +20,9 @@ Factorio Client (UDP :34197 Vanilla / :34198 Deathworld / ...)
 │  2. Drops small/malformed internet UDP scanner packets   │
 │  3. If target world is SUSPENDED:                        │
 │     • Preempts & saves any other idle world on the pool  │
-│     • Calls ate.v1alpha1.Actors.ResumeActor (mTLS gRPC)  │
+│     • Wakes Actor via atenet-router (mTLS WSS :443/ws)   │
 │     • Buffers initial UDP handshake datagrams            │
-│  4. Opens WebSocket tunnel via atenet-router (:8080/ws)  │
+│  4. Opens WebSocket tunnel via atenet-router (:443/ws)   │
 │     with header `ate-target-actor: factorio/<world>`     │
 │  5. Tracks bidirectional UDP traffic; after 10m of       │
 │     silence, triggers RCON `/server-save` + SuspendActor │
@@ -107,21 +107,9 @@ From your Agent Substrate checkout (`$SUBSTRATE_REPO`), bootstrap the GKE cluste
 
 ```bash
 cd "$SUBSTRATE_REPO"
-go run ./tools/setup-gcp bootstrap \
-  --project "$PROJECT_ID" \
-  --cluster "$CLUSTER_NAME" \
-  --bucket "$BUCKET_NAME" \
-  --zone "$CLUSTER_LOCATION"
-
-# Disable node pool auto-upgrade so the custom atelet DaemonSet stays version-aligned
-gcloud container node-pools update substrate-node-pool \
-  --cluster="$CLUSTER_NAME" \
-  --zone="$CLUSTER_LOCATION" \
-  --project="$PROJECT_ID" \
-  --no-enable-autoupgrade
-
-# Build and deploy Agent Substrate control plane + atelet DaemonSet
-ATE_ENV_FILE="$(pwd)/../factorio-substrate/.ate-dev-env.sh" ./hack/install-ate.sh --deploy-ate-system
+# Build and deploy Agent Substrate 1.0 control plane + atelet DaemonSet
+source "$(pwd)/../factorio-substrate/.ate-dev-env.sh"
+go run ./cmd/ate-setup deploy ate-system --no-dev-env --sandbox-classes=gvisor
 ```
 
 ### 3. Deploy Factorio Gateway, Sidecar, WorkerPool, and Worlds

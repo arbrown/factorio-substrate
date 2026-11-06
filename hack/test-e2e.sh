@@ -72,7 +72,7 @@ echo "==> Step 1: Checking initial Actor states..."
 run_kubectl_ate get actor -a factorio
 
 echo "==> Step 2: Probing world-vanilla on ${EXTERNAL_IP}:34197/UDP..."
-go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=60s
+go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=180s
 
 echo "==> Step 3: Verifying world-vanilla is RUNNING and querying RCON status..."
 run_kubectl_ate get actor world-vanilla -a factorio

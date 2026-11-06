@@ -1,10 +1,17 @@
 # Copy this file to .ate-dev-env.sh and customize it for your GCP project.
 export PROJECT_ID="your-gcp-project-id"
-export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+export CLOUDSDK_CORE_PROJECT="${PROJECT_ID}"
+export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --project="${PROJECT_ID}" --format='value(projectNumber)')"
 export GCE_REGION="us-central1"
 export CLUSTER_LOCATION="us-central1-a"
 export CLUSTER_NAME="factorio-ate"
 export BUCKET_NAME="${PROJECT_ID}-factorio-ate"
+export SNAPSHOT_LOCATION="gs://${BUCKET_NAME}/factorio/"
+export SNAPSHOT_TRANSFER_GSA_NAME="ate-snapshot-transfer"
+export ATE_CREDENTIAL_PROVIDER='{"enabled":false}'
+export ATE_INSTALL_E2E_TUNING="true"
+export ATE_INGRESS_ALLOWED_SPIFFE_IDS="spiffe://cluster.local/ns/ate-system/sa/atenet-client,spiffe://cluster.local/ns/factorio/sa/factorio-gateway"
+export ATE_API_AUTHZ_BOOTSTRAP_OWNERS="system:serviceaccount:ate-system:ate-client,spiffe://cluster.local/ns/factorio/sa/factorio-gateway"
 export KO_DOCKER_REPO="gcr.io/${PROJECT_ID}/factorio-ate-images"
 export KO_DEFAULTPLATFORMS="linux/amd64"
 export SUBSTRATE_REPO="/path/to/substrate"

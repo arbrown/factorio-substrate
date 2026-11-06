@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -516,5 +517,145 @@ func TestGatewayWorkerPoolScaleToZeroAndColdWake(t *testing.T) {
 	calls = scaler.calls()
 	if calls[len(calls)-1] != 0 {
 		t.Fatalf("expected /scale?replicas=0 to scale down, got calls: %v", calls)
+	}
+}
+
+func TestGatewayRouterTLSAndV1WorkerPoolScaler(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+	var prepareSuspendTLS, wsTLS bool
+	var mu sync.Mutex
+
+	routerSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/prepare-suspend" {
+			mu.Lock()
+			prepareSuspendTLS = r.TLS != nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"save_output":"Saved"}`))
+			return
+		}
+		if r.URL.Path == "/status" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"world":"vanilla"}`))
+			return
+		}
+		mu.Lock()
+		wsTLS = r.TLS != nil
+		mu.Unlock()
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			mt, frame, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			clientAddr, payload, err := tunnelproto.DecodeFrame(frame)
+			if err != nil {
+				continue
+			}
+			replyFrame, _ := tunnelproto.EncodeFrame(clientAddr, append([]byte("tls:"), payload...))
+			_ = ws.WriteMessage(mt, replyFrame)
+		}
+	}))
+	defer routerSrv.Close()
+
+	// Verify k8sWorkerPoolScaler targets /apis/ate.dev/v1/namespaces/factorio/workerpools/factorio
+	var k8sPath string
+	k8sSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		k8sPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"spec":{"replicas":1},"status":{"readyReplicas":1,"replicas":1}}`))
+	}))
+	defer k8sSrv.Close()
+
+	tokenFile := t.TempDir() + "/token"
+	if err := os.WriteFile(tokenFile, []byte("test-token"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	k8sScaler := &k8sWorkerPoolScaler{
+		baseURL:    k8sSrv.URL,
+		tokenPath:  tokenFile,
+		httpClient: k8sSrv.Client(),
+	}
+	wpStatus, err := k8sScaler.GetWorkerPoolStatus(context.Background(), "factorio", "factorio")
+	if err != nil {
+		t.Fatalf("GetWorkerPoolStatus failed: %v", err)
+	}
+	if k8sPath != "/apis/ate.dev/v1/namespaces/factorio/workerpools/factorio" {
+		t.Fatalf("expected /apis/ate.dev/v1/namespaces/factorio/workerpools/factorio, got %q", k8sPath)
+	}
+	if wpStatus.SpecReplicas != 1 || wpStatus.ReadyReplicas != 1 {
+		t.Fatalf("unexpected WorkerPoolStatus: %+v", wpStatus)
+	}
+
+	routerHost := strings.TrimPrefix(routerSrv.URL, "https://")
+	routerTransport := routerSrv.Client().Transport.(*http.Transport)
+	suspender := &fakeSuspender{}
+
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:        "127.0.0.1",
+		RouterHTTPAddr:   routerHost,
+		RouterTLSConfig:  routerTransport.TLSClientConfig,
+		IdleTimeout:      5 * time.Second,
+		WSRotateInterval: 10 * time.Second,
+		MaxActiveWorlds:  1,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := gw.Start(ctx); err != nil {
+		t.Fatalf("gw.Start failed: %v", err)
+	}
+	defer gw.Close()
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	probe := tunnelproto.BuildFactorioProbePacket(999)
+	_, _ = clientConn.WriteToUDP(probe, vanillaWT.LocalUDPAddr().(*net.UDPAddr))
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	n, _, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("ReadFromUDP over wss:// failed: %v", err)
+	}
+	if !bytes.HasPrefix(buf[:n], []byte("tls:")) {
+		t.Fatalf("unexpected reply: %q", string(buf[:n]))
+	}
+
+	// Test /world-status over https://
+	wsReq := httptest.NewRequest(http.MethodGet, "/world-status?actor=factorio/world-vanilla", nil)
+	wsRec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(wsRec, wsReq)
+	if wsRec.Code != http.StatusOK {
+		t.Fatalf("/world-status failed: code=%d body=%s", wsRec.Code, wsRec.Body.String())
+	}
+
+	// Test manual /suspend over https://
+	suspReq := httptest.NewRequest(http.MethodPost, "/suspend?actor=factorio/world-vanilla", nil)
+	suspRec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(suspRec, suspReq)
+	if suspRec.Code != http.StatusOK {
+		t.Fatalf("/suspend failed: code=%d body=%s", suspRec.Code, suspRec.Body.String())
+	}
+
+	mu.Lock()
+	gotWS, gotPrep := wsTLS, prepareSuspendTLS
+	mu.Unlock()
+	if !gotWS || !gotPrep {
+		t.Fatalf("expected both WebSocket (%v) and prepare-suspend (%v) to use TLS", gotWS, gotPrep)
 	}
 }

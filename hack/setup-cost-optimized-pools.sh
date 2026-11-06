@@ -31,12 +31,10 @@ echo " Setting up Cost-Optimized Node Pools (Option A Scale-to-Zero)"
 echo " Cluster:  ${CLUSTER_NAME} (${CLUSTER_LOCATION}) in project ${PROJECT_ID}"
 echo "================================================================================"
 
-SUBSTRATE_VERSION="$(kubectl get ds -n ate-system -l app=atelet -o jsonpath='{.items[0].metadata.labels.ate\.dev/substrate-version}')"
-if [[ -z "${SUBSTRATE_VERSION}" ]]; then
+if ! kubectl get ds -n ate-system atelet >/dev/null 2>&1; then
   echo "error: could not find atelet DaemonSet in namespace ate-system" >&2
   exit 1
 fi
-echo "==> Substrate version: ${SUBSTRATE_VERSION}"
 
 # 1. Back up postgres data before touching storage.
 echo "==> Backing up postgres database 'atepg'..."
@@ -71,7 +69,8 @@ if gcloud container node-pools describe substrate-worker-pool --cluster "${CLUST
 fi
 
 if ! gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  echo "==> Creating Spot 'substrate-worker-pool' (0 -> 1 n2-standard-2 Ice Lake, scale-to-zero)..."
+  MAX_WORKER_NODES="${MAX_WORKER_NODES:-1}"
+  echo "==> Creating Spot 'substrate-worker-pool' (0 -> ${MAX_WORKER_NODES} n2-standard-2 Ice Lake, scale-to-zero)..."
   gcloud container node-pools create substrate-worker-pool \
     --cluster "${CLUSTER_NAME}" \
     --zone "${CLUSTER_LOCATION}" \
@@ -83,8 +82,7 @@ if ! gcloud container node-pools describe substrate-worker-pool --cluster "${CLU
     --disk-type=pd-balanced \
     --enable-autoscaling \
     --min-nodes=0 \
-    --max-nodes=1 \
-    --node-labels="ate.dev/substrate-version=${SUBSTRATE_VERSION}" \
+    --max-nodes="${MAX_WORKER_NODES}" \
     --node-taints="ate.dev/sandboxClass=gvisor:NoSchedule"
 fi
 
@@ -166,16 +164,29 @@ if gcloud container node-pools describe substrate-node-pool --cluster "${CLUSTER
   done
 fi
 
-# 5. Annotate atelet DaemonSet so Cluster Autoscaler can evict it during scale-to-zero.
-echo "==> Annotating atelet DaemonSet with safe-to-evict..."
-kubectl patch ds -n ate-system "atelet-${SUBSTRATE_VERSION}" \
+# 5. Annotate atelet DaemonSet so Cluster Autoscaler can evict it during scale-to-zero,
+#    right-size CPU requests on atelet and atenet-egress for the e2-medium control-pool,
+#    and set fast snapshot upload/detach delays so scale-to-zero never drops pending local snapshots.
+echo "==> Annotating atelet DaemonSet with safe-to-evict and right-sizing CPU requests..."
+kubectl patch ds -n ate-system atelet \
   -p '{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"true"}}}}}' || true
+kubectl patch ds -n ate-system atelet --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"5m"},{"op":"replace","path":"/spec/template/spec/containers/1/resources/requests/cpu","value":"5m"}]' || true
+if ! kubectl get ds -n ate-system atelet -o jsonpath='{.spec.template.spec.containers[0].args[*]}' | grep -q -- '--snapshot-upload-delay='; then
+  kubectl patch ds -n ate-system atelet --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-upload-delay=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-detach-delay=30s"}]' || true
+fi
+kubectl patch deployment -n ate-system atenet-egress --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"5m"},{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' || true
+kubectl patch deployment -n kube-system konnectivity-agent --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"ate.dev/sandboxClass","operator":"Exists"}}]' || true
 
-# 6. Scale ate-api-server to 1 replica to conserve resources on control-pool.
-echo "==> Scaling ate-api-server to 1 replica..."
+# 6. Scale ate-api-server and ate-idp-server to 1 replica to conserve resources on control-pool.
+echo "==> Scaling ate-api-server and ate-idp-server to 1 replica..."
 kubectl scale deployment/ate-api-server -n ate-system --replicas=1
+kubectl scale deployment/ate-idp-server -n ate-system --replicas=1 || true
 
-# 7. Right-size postgres storage from 500Gi to 10Gi and requests to 25m/128Mi.
+# 7. Right-size postgres storage from 500Gi to 10Gi and requests to 5m/128Mi.
 CURRENT_STORAGE="$(kubectl get pvc -n ate-system data-postgres-0 -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || echo "")"
 if [[ "${CURRENT_STORAGE}" == "500Gi" ]]; then
   echo "==> Right-sizing postgres from 500Gi to 10Gi..."
@@ -208,6 +219,8 @@ spec:
         env:
         - name: POSTGRES_DB
           value: atepg
+        - name: POSTGRES_USER
+          value: postgres
         - name: POSTGRES_HOST_AUTH_METHOD
           value: trust
         - name: PGDATA
@@ -233,12 +246,12 @@ spec:
           periodSeconds: 10
         readinessProbe:
           exec:
-            command: ["/bin/sh", "-ec", "psql -U postgres -d atepg -Atc 'SELECT 1' >/dev/null"]
+            command: ["/bin/sh", "-ec", "nc -z 127.0.0.1 5432"]
           initialDelaySeconds: 2
           periodSeconds: 2
         resources:
           requests:
-            cpu: 25m
+            cpu: 5m
             memory: 128Mi
           limits:
             cpu: "1"
@@ -249,8 +262,8 @@ spec:
         - name: servicedns
           mountPath: /run/servicedns.podcert.ate.dev
           readOnly: true
-        - name: podidentity-ca
-          mountPath: /run/podidentity.podcert.ate.dev
+        - name: postgres-ca
+          mountPath: /run/postgres.podcert.ate.dev
           readOnly: true
         - name: socket
           mountPath: /var/run/postgresql
@@ -259,10 +272,13 @@ spec:
       initContainers:
       - name: tls-reloader
         image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+        - name: POSTGRES_USER
+          value: postgres
         command: ["/bin/sh", "/etc/postgresql/reload-tls.sh"]
         resources:
           requests:
-            cpu: 10m
+            cpu: 5m
             memory: 32Mi
         restartPolicy: Always
         securityContext:
@@ -273,8 +289,8 @@ spec:
         - name: servicedns
           mountPath: /run/servicedns.podcert.ate.dev
           readOnly: true
-        - name: podidentity-ca
-          mountPath: /run/podidentity.podcert.ate.dev
+        - name: postgres-ca
+          mountPath: /run/postgres.podcert.ate.dev
           readOnly: true
         - name: socket
           mountPath: /var/run/postgresql
@@ -287,6 +303,7 @@ spec:
           name: postgres-config
       - name: servicedns
         projected:
+          defaultMode: 0600
           sources:
           - podCertificate:
               signerName: servicedns.podcert.ate.dev/identity
@@ -294,11 +311,11 @@ spec:
               credentialBundlePath: credential-bundle.pem
       - name: socket
         emptyDir: {}
-      - name: podidentity-ca
+      - name: postgres-ca
         projected:
           sources:
           - clusterTrustBundle:
-              signerName: podidentity.podcert.ate.dev/identity
+              signerName: postgres.podcert.ate.dev/identity
               labelSelector:
                 matchLabels:
                   podcert.ate.dev/canarying: live

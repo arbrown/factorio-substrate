@@ -28,6 +28,8 @@ fi
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
 IDLE_TIMEOUT="${IDLE_TIMEOUT:-10m}"
 WORKERPOOL_IDLE_TIMEOUT="${WORKERPOOL_IDLE_TIMEOUT:-2m}"
+MAX_ACTIVE_WORLDS="${MAX_ACTIVE_WORLDS:-1}"
+PREEMPT_IDLE_GRACE="${PREEMPT_IDLE_GRACE:-5s}"
 BASE_UDP_PORT="${BASE_UDP_PORT:-34197}"
 if [[ -n "${WORLDS_LIST:-}" ]]; then
   read -r -a WORLDS <<< "${WORLDS_LIST}"
@@ -55,20 +57,28 @@ run_ko() {
   "${KO_BIN}" "$@"
 }
 
+KUBECTL_ATE_BIN="/tmp/kubectl-ate-deploy"
+(cd "${SUBSTRATE_REPO}" && go build -o "${KUBECTL_ATE_BIN}" ./cmd/kubectl-ate)
 run_kubectl_ate() {
-  (cd "${SUBSTRATE_REPO}" && go run ./cmd/kubectl-ate "$@")
+  "${KUBECTL_ATE_BIN}" "$@"
 }
 
-echo "==> Resolving Substrate version from cluster atelet DaemonSet..."
-SUBSTRATE_VERSION="$(kubectl get ds -n ate-system -l app=atelet -o jsonpath='{.items[0].metadata.labels.ate\.dev/substrate-version}')"
-if [[ -z "${SUBSTRATE_VERSION}" ]]; then
+echo "==> Checking cluster atelet DaemonSet..."
+if ! kubectl get ds -n ate-system atelet >/dev/null 2>&1; then
   echo "error: could not find atelet DaemonSet in namespace ate-system" >&2
   exit 1
 fi
-echo "    SUBSTRATE_VERSION=${SUBSTRATE_VERSION}"
+kubectl patch ds -n ate-system atelet \
+  -p '{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"true"}}}}}' >/dev/null 2>&1 || true
+if ! kubectl get ds -n ate-system atelet -o jsonpath='{.spec.template.spec.containers[0].args[*]}' | grep -q -- '--snapshot-upload-delay='; then
+  echo "    Configuring atelet background snapshot upload (2s) and detach (30s) delays for scale-to-zero..."
+  kubectl patch ds -n ate-system atelet --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-upload-delay=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-detach-delay=30s"}]'
+  kubectl rollout status ds/atelet -n ate-system --timeout=120s
+fi
 
-echo "==> Building/resolving ateom-gvisor worker image..."
-WORKER_IMAGE="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh ko build ./cmd/ateom-gvisor)"
+echo "==> Building/resolving ateworker-gvisor worker image..."
+WORKER_IMAGE="$(cd "${SUBSTRATE_REPO}" && ./hack/run-tool.sh ko build ./cmd/ateworker-gvisor)"
 echo "    WORKER_IMAGE=${WORKER_IMAGE}"
 
 echo "==> Ensuring GCP Firewall Rule allows UDP hostPorts (34197-34297)..."
@@ -87,16 +97,17 @@ if kubectl get svc -n factorio factorio-gateway >/dev/null 2>&1; then
   kubectl delete svc -n factorio factorio-gateway --ignore-not-found
 fi
 
-echo "==> Deploying factorio Namespace, WorkerPool, and UDP Gateway (IDLE_TIMEOUT=${IDLE_TIMEOUT}, WORKERPOOL_IDLE_TIMEOUT=${WORKERPOOL_IDLE_TIMEOUT})..."
-export SUBSTRATE_VERSION WORKER_IMAGE IDLE_TIMEOUT WORKERPOOL_IDLE_TIMEOUT
+echo "==> Deploying factorio Namespace, WorkerPool, and UDP Gateway (IDLE_TIMEOUT=${IDLE_TIMEOUT}, WORKERPOOL_IDLE_TIMEOUT=${WORKERPOOL_IDLE_TIMEOUT}, MAX_ACTIVE_WORLDS=${MAX_ACTIVE_WORLDS}, WORLDS=${#WORLDS[@]})..."
+export WORKER_IMAGE IDLE_TIMEOUT WORKERPOOL_IDLE_TIMEOUT MAX_ACTIVE_WORLDS PREEMPT_IDLE_GRACE
 python3 -c '
 import os, sys
 tmpl = open("manifests/factorio-substrate.yaml.tmpl").read()
 replacements = {
-    "${SUBSTRATE_VERSION}": os.environ["SUBSTRATE_VERSION"],
     "${WORKER_IMAGE}": os.environ["WORKER_IMAGE"],
     "${IDLE_TIMEOUT}": os.environ["IDLE_TIMEOUT"],
     "${WORKERPOOL_IDLE_TIMEOUT}": os.environ["WORKERPOOL_IDLE_TIMEOUT"],
+    "${MAX_ACTIVE_WORLDS}": os.environ["MAX_ACTIVE_WORLDS"],
+    "${PREEMPT_IDLE_GRACE}": os.environ["PREEMPT_IDLE_GRACE"],
     "${ROUTES_ARG}": os.environ["ROUTES_ARG"],
     "${GATEWAY_UDP_PORTS}": os.environ["GATEWAY_UDP_PORTS"].rstrip(),
 }
@@ -106,8 +117,22 @@ sys.stdout.write(tmpl)
 ' | run_ko resolve -f - \
   | kubectl apply -f -
 
-echo "==> Ensuring WorkerPool has 1 replica during deployment..."
-kubectl patch workerpool factorio -n factorio --type=merge -p '{"spec":{"replicas":1}}' || true
+echo "==> Ensuring WorkerPool has ${MAX_ACTIVE_WORLDS} replica(s) during deployment..."
+if [[ "${RESIZE_NODEPOOL:-true}" == "true" ]] && [[ -n "${CLUSTER_NAME:-}" ]] && [[ -n "${CLUSTER_LOCATION:-}" ]]; then
+  CURRENT_MAX_NODES="$(gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(autoscaling.maxNodeCount)' 2>/dev/null || echo "")"
+  if [[ -n "${CURRENT_MAX_NODES}" && "${CURRENT_MAX_NODES}" != "${MAX_ACTIVE_WORLDS}" ]]; then
+    echo "    Updating 'substrate-worker-pool' autoscaling max-nodes (${CURRENT_MAX_NODES} -> ${MAX_ACTIVE_WORLDS})..."
+    gcloud container node-pools update substrate-worker-pool \
+      --cluster "${CLUSTER_NAME}" \
+      --zone "${CLUSTER_LOCATION}" \
+      --project "${PROJECT_ID}" \
+      --enable-autoscaling \
+      --min-nodes=0 \
+      --max-nodes="${MAX_ACTIVE_WORLDS}" \
+      --quiet || true
+  fi
+fi
+kubectl patch workerpool factorio -n factorio --type=merge -p "{\"spec\":{\"replicas\":${MAX_ACTIVE_WORLDS}}}" || true
 
 echo "==> Waiting for WorkerPool and UDP Gateway to roll out..."
 kubectl wait --for=create deployment/factorio -n factorio --timeout=120s
@@ -147,18 +172,15 @@ fi
 echo "==> Checking 'factorio-server' ActorTemplate..."
 if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&1; then
   TMPL_JSON="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json)"
-  SNAP_URI="$(echo "${TMPL_JSON}" | jq -r '.status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty')"
+  SNAP_URI="$(echo "${TMPL_JSON}" | jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty')"
   CUR_FACTORIO_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="factorio") | .image // empty')"
   CUR_SIDECAR_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="sidecar") | .image // empty')"
   if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" || "${CUR_SIDECAR_IMAGE}" != "${NEW_SIDECAR_IMAGE}" || "${RECREATE_TEMPLATE:-false}" == "true" ]]; then
     OLD_UID="$(echo "${TMPL_JSON}" | jq -r '.metadata.uid // empty')"
     echo "    Recreating factorio-server ActorTemplate (factorio=${FACTORIO_IMAGE}, sidecar=${NEW_SIDECAR_IMAGE})..."
     for ACTOR in "${WORLDS[@]}"; do
-      if [[ "${RESET_WORLDS:-false}" == "true" ]]; then
-        run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
-      else
-        run_kubectl_ate suspend actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
-      fi
+      run_kubectl_ate suspend actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
+      run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
     done
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
     if [[ -n "${OLD_UID}" ]]; then
@@ -176,7 +198,7 @@ fi
 echo "==> Waiting for 'factorio-server' ActorTemplate Golden Snapshot to become Ready..."
 for i in {1..90}; do
   STATUS="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json 2>/dev/null || true)"
-  if echo "${STATUS}" | grep -q '"snapshotUri"'; then
+  if echo "${STATUS}" | grep -q '"goldenTag"'; then
     echo "    Golden Snapshot Ready!"
     break
   fi
@@ -188,12 +210,39 @@ for i in {1..90}; do
   sleep 5
 done
 
-echo "==> Creating Factorio world Actors (${WORLDS[*]})..."
+echo "==> Creating Factorio world Actors (${#WORLDS[@]} worlds)..."
+EXISTING_ACTORS="$(run_kubectl_ate get actors -a factorio -o json 2>/dev/null | jq -r '.actors[]?.metadata.name // empty' || true)"
+if [[ "${PRUNE_EXTRA_WORLDS:-true}" == "true" && -n "${EXISTING_ACTORS}" ]]; then
+  WANT_ACTORS="$(printf "%s\n" "${WORLDS[@]}")"
+  PRUNE_BATCH=0
+  for EXISTING in ${EXISTING_ACTORS}; do
+    if ! grep -qx "${EXISTING}" <<< "${WANT_ACTORS}"; then
+      echo "    Pruning extra Actor '${EXISTING}' not in target WORLDS list..."
+      (
+        run_kubectl_ate suspend actor "${EXISTING}" -a factorio >/dev/null 2>&1 || true
+        run_kubectl_ate delete actor "${EXISTING}" -a factorio >/dev/null 2>&1 || true
+      ) &
+      PRUNE_BATCH=$((PRUNE_BATCH + 1))
+      if [[ "${PRUNE_BATCH}" -ge 8 ]]; then
+        wait
+        PRUNE_BATCH=0
+      fi
+    fi
+  done
+  wait
+fi
+BATCH=0
 for ACTOR in "${WORLDS[@]}"; do
-  if ! run_kubectl_ate get actor "${ACTOR}" -a factorio >/dev/null 2>&1; then
-    run_kubectl_ate create actor "${ACTOR}" -a factorio --template factorio-server
+  if ! grep -qx "${ACTOR}" <<< "${EXISTING_ACTORS}"; then
+    run_kubectl_ate create actor "${ACTOR}" -a factorio --template factorio-server >/dev/null &
+    BATCH=$((BATCH + 1))
+    if [[ "${BATCH}" -ge 8 ]]; then
+      wait
+      BATCH=0
+    fi
   fi
 done
+wait
 
 echo "==> Current Actors in 'factorio' atespace:"
 run_kubectl_ate get actor -a factorio

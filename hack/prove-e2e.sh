@@ -82,7 +82,7 @@ echo ""
 echo "================================================================================"
 echo " PHASE 1: Wake world-vanilla via UDP (${EXTERNAL_IP}:34197) & Mutate Game World"
 echo "================================================================================"
-go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=60s
+go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=180s
 
 LUA_MUTATE='/sc local s = game.surfaces["nauvis"]; local e = s.find_entity("steel-chest", {0.5, 0.5}) or s.create_entity{name="steel-chest", position={0.5, 0.5}, force="player"}; e.clear_items_inside(); e.insert{name="automation-science-pack", count=42}; rcon.print("NAUVIS_CHEST_SCIENCE_PACKS=" .. e.get_item_count("automation-science-pack") .. " TICK=" .. game.tick)'
 # Run twice in case this is the first Lua command on the save (Factorio achievement warning).
@@ -125,7 +125,7 @@ echo "==========================================================================
 echo " PHASE 4: Suspend Active World Back to GCS (Both Actors -> SUSPENDED)"
 echo "================================================================================"
 curl -fsS -X POST "http://127.0.0.1:18080/suspend?actor=factorio/world-vanilla" && echo ""
-sleep 3
+sleep 6
 "${KUBECTL_ATE_BIN}" get actors -a factorio
 
 kill "${WATCH_PID}" >/dev/null 2>&1 || true
@@ -151,12 +151,12 @@ kubectl logs -n factorio "${WORKER_POD}" --tail=400 | grep -E '"ate.actor.contai
 echo ""
 echo "--- 5d. Node Agent (atelet on ${WORKER_NODE}) Snapshot Upload/Download Logs ---"
 ATELET_POD="$(kubectl get pods -n ate-system -l app=atelet --field-selector spec.nodeName="${WORKER_NODE}" -o jsonpath='{.items[0].metadata.name}')"
-kubectl logs -n ate-system "${ATELET_POD}" --tail=100 | grep -E "Compressed zstd upload|Decompressed zstd download|/atelet.AteomHerder/Checkpoint|/atelet.AteomHerder/Restore" | tail -n 15 || true
+kubectl logs -n ate-system "${ATELET_POD}" --all-containers=true --tail=200 | grep -E "Compressed zstd upload|Decompressed zstd download|Checkpoint|Restore" | tail -n 15 || true
 
 echo ""
 echo "--- 5e. Actual Snapshot Artifacts in Google Cloud Storage ---"
-VANILLA_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-vanilla -a factorio -o json | jq -r '.status.externalSnapshot.snapshotUri // empty')"
-DEATHWORLD_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-deathworld -a factorio -o json | jq -r '.status.externalSnapshot.snapshotUri // empty')"
+VANILLA_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-vanilla -a factorio -o json | jq -r '.status.snapshots[-1].durableSnapshot.object.snapshotUri // empty')"
+DEATHWORLD_SNAP="$("${KUBECTL_ATE_BIN}" get actor world-deathworld -a factorio -o json | jq -r '.status.snapshots[-1].durableSnapshot.object.snapshotUri // empty')"
 echo "world-vanilla latest snapshot:    ${VANILLA_SNAP}"
 gcloud storage ls -l "${VANILLA_SNAP}/" || true
 echo "world-deathworld latest snapshot: ${DEATHWORLD_SNAP}"

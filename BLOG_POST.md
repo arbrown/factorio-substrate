@@ -144,7 +144,7 @@ containers:
   - "--factorio-dir="
   - "--rcon-password=substrate-factorio-rcon"
   - "--system-info-dir=/run/ate"
-  readyz:
+  wakeupProbe:
     httpGet:
       path: /readyz
       port: 80
@@ -185,7 +185,7 @@ containers:
       --server-id /factorio/config/server-id.json \
       --mod-directory /factorio/mods \
       --start-server-load-latest
-  readyz:
+  wakeupProbe:
     httpGet:
       path: /readyz
       port: 80
@@ -195,17 +195,10 @@ containers:
     mountPath: /factorio
 resources:
   limits:
-  - name: cpu
-    quantity: "2"
-  - name: memory
-    quantity: 4Gi
-snapshotsConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
-  storageLocation: gs://${BUCKET_NAME}/factorio/
-sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
-  configName: gvisor-default
+    cpuMillicores: 2000
+    memoryBytes: 3758096384
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
 volumes:
 - name: factorio-data
   durableDir: {}
@@ -235,19 +228,8 @@ export KO_DOCKER_REPO="gcr.io/${PROJECT_ID}/factorio-ate-images"
 From your Agent Substrate checkout, bootstrap the GKE cluster (`c3-standard-4` nodes) and GCS snapshot bucket, and install `ate-system`:
 
 ```bash
-go run ./tools/setup-gcp bootstrap \
-  --project "$PROJECT_ID" \
-  --cluster "$CLUSTER_NAME" \
-  --bucket "$BUCKET_NAME" \
-  --zone "$CLUSTER_LOCATION"
-
-gcloud container node-pools update substrate-node-pool \
-  --cluster="$CLUSTER_NAME" \
-  --zone="$CLUSTER_LOCATION" \
-  --project="$PROJECT_ID" \
-  --no-enable-autoupgrade
-
-./hack/install-ate.sh --deploy-ate-system
+source /path/to/factorio-substrate/.ate-dev-env.sh
+go run ./cmd/ate-setup deploy ate-system --no-dev-env --sandbox-classes=gvisor
 ```
 
 ### 3. Deploying the Gateway, WorkerPool, and Factorio Worlds
@@ -348,7 +330,7 @@ We dug into Agent Substrate's resume workflow (`workflow_resume.go`), and it tur
   TemplateReplaced: builtOnTemplateUID != "" && builtOnTemplateUID != actorTemplate.GetMetadata().GetUid()
   ```
 * When `TemplateReplaced` is `true`, Substrate automatically switches **that single wake-up** from `SNAPSHOT_SCOPE_FULL` (memory restore) to **`SNAPSHOT_SCOPE_DATA` (`RESUME_SOURCE_COLD_BOOT`)**!
-* Inside the worker pod, `ateom-gvisor` extracts only the Actor's `durable-dir.tar.zstd` (`/factorio/saves/_autosave1.zip`) into the **new** Factorio `2.1.24` container and cold-boots `/opt/factorio/bin/x64/factorio --start-server-load-latest`. Factorio automatically migrates `_autosave1.zip` from `2.1.23` to `2.1.24`, and Substrate stamps the new `currentActorTemplateUid`.
+* Inside the worker pod, `ateworker-gvisor` extracts only the Actor's `durable-dir.tar.zstd` (`/factorio/saves/_autosave1.zip`) into the **new** Factorio `2.1.24` container and cold-boots `/opt/factorio/bin/x64/factorio --start-server-load-latest`. Factorio automatically migrates `_autosave1.zip` from `2.1.23` to `2.1.24`, and Substrate stamps the new `currentActorTemplateUid`.
 * From the very next suspend onward, `world-vanilla` is right back on **1.5-second `SNAPSHOT_SCOPE_FULL` memory restores** on `2.1.24`!
 
 ### Automating Both Ends in `factorio-gateway`: Proactive + Reactive

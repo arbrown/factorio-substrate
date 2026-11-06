@@ -16,6 +16,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: factorio
+  labels:
+    ate.dev/api-access: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -47,7 +49,7 @@ roleRef:
   name: factorio-gateway-workerpool-scaler
   apiGroup: rbac.authorization.k8s.io
 ---
-apiVersion: ate.dev/v1alpha1
+apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
   name: factorio
@@ -60,11 +62,13 @@ spec:
   # Single physical worker pod that multiplexes all 4 Factorio worlds
   # (world-vanilla, world-deathworld, world-railworld, world-ribbonworld) on demand.
   # Automatically scaled 0 -> 1 on inbound UDP traffic and 1 -> 0 after idle timeout.
-  replicas: 1
+  replicas: ${MAX_ACTIVE_WORLDS}
   workerImage: ${WORKER_IMAGE}
+  sandboxClasses:
+  - name: gvisor
   template:
     nodeSelector:
-      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      cloud.google.com/gke-nodepool: substrate-worker-pool
     tolerations:
     - key: "ate.dev/sandboxClass"
       operator: "Equal"
@@ -107,13 +111,15 @@ spec:
         - "--routes=${ROUTES_ARG}"
         - "--idle-timeout=${IDLE_TIMEOUT}"
         - "--ws-rotate-interval=4m"
-        - "--preempt-idle-grace=5s"
-        - "--max-active-worlds=1"
+        - "--preempt-idle-grace=${PREEMPT_IDLE_GRACE}"
+        - "--max-active-worlds=${MAX_ACTIVE_WORLDS}"
         - "--workerpool-namespace=factorio"
         - "--workerpool-name=factorio"
         - "--workerpool-idle-timeout=${WORKERPOOL_IDLE_TIMEOUT}"
         - "--resume-timeout=5m"
-        - "--router-http-addr=atenet-router.ate-system.svc.cluster.local:80"
+        - "--router-http-addr=atenet-router.ate-system.svc.cluster.local:443"
+        - "--router-tls=true"
+        - "--router-server-name=atenet-router.ate-system.svc"
         - "--ateapi-address=api.ate-system.svc.cluster.local:443"
         - "--ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem"
         - "--ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
