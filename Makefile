@@ -1,4 +1,4 @@
-.PHONY: test build deploy verify verify-with-idle prove watch watch-transitions check-update status clean optimize-cluster
+.PHONY: test build deploy verify verify-with-idle prove test-preemption watch watch-transitions check-update status clean optimize-cluster
 
 test:
 	go test -v -race ./...
@@ -20,6 +20,9 @@ verify:
 
 prove:
 	./hack/prove-e2e.sh
+
+test-preemption:
+	./hack/test-spot-cascade-preemption.sh
 
 watch:
 	./hack/watch-actors.sh

@@ -34,6 +34,9 @@ rules:
 - apiGroups: ["ate.dev"]
   resources: ["workerpools"]
   verbs: ["get", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -48,6 +51,70 @@ roleRef:
   kind: Role
   name: factorio-gateway-workerpool-scaler
   apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: factorio-gateway-node-watcher
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: factorio-gateway-node-watcher
+subjects:
+- kind: ServiceAccount
+  name: factorio-gateway
+  namespace: factorio
+roleRef:
+  kind: ClusterRole
+  name: factorio-gateway-node-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: factorio-substrate-worker
+spec:
+  description: "Multi-zone Spot-first cascade with On-Demand fallback for Factorio Agent Substrate workers"
+  whenUnsatisfiable: ScaleUpAnyway
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: true
+  priorityDefaults:
+    location:
+      zones:
+      - us-central1-a
+      - us-central1-b
+      - us-central1-c
+      - us-central1-f
+      locationPolicy: ANY
+  priorities:
+  # Priority 1: Spot n2-standard-2 (Intel Ice Lake) across ANY zone in us-central1 ($0.022/hr VM)
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  # Priority 2: Spot n2-standard-4 (Intel Ice Lake) across ANY zone ($0.044/hr VM, fits 2-3 worlds)
+  - machineType: n2-standard-4
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  # Priority 3: On-Demand n2-standard-2 (Intel Ice Lake) fallback if Spot is stocked out region-wide ($0.097/hr)
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: false
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
 ---
 apiVersion: ate.dev/v1
 kind: WorkerPool
@@ -68,11 +135,15 @@ spec:
   - name: gvisor
   template:
     nodeSelector:
-      cloud.google.com/gke-nodepool: substrate-worker-pool
+      cloud.google.com/compute-class: factorio-substrate-worker
     tolerations:
     - key: "ate.dev/sandboxClass"
       operator: "Equal"
       value: "gvisor"
+      effect: "NoSchedule"
+    - key: "cloud.google.com/compute-class"
+      operator: "Equal"
+      value: "factorio-substrate-worker"
       effect: "NoSchedule"
     resources:
       limits:

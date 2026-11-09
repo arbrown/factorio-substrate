@@ -73,6 +73,27 @@ type WorkerPoolScaler interface {
 	SetWorkerPoolReplicas(ctx context.Context, namespace, name string, replicas int32) (WorkerPoolStatus, error)
 }
 
+// PreemptingWorkerPod describes a WorkerPool pod whose underlying GKE node is
+// being preempted, cordoned, or drained (e.g. Spot VM preemption or
+// ComputeClass Active Migration).
+type PreemptingWorkerPod struct {
+	PodName     string `json:"pod_name"`
+	NodeName    string `json:"node_name"`
+	Zone        string `json:"zone"`
+	MachineType string `json:"machine_type"`
+	Spot        string `json:"spot"`
+	Reason      string `json:"reason"`
+}
+
+// WorkerPreemptionWatcher is an optional extension implemented by
+// WorkerPoolScaler that detects impending Spot node preemptions or node drains
+// so the gateway can checkpoint running Actors to GCS during the 30-second
+// graceful shutdown window and make-before-break onto a replacement node.
+type WorkerPreemptionWatcher interface {
+	ListPreemptingWorkers(ctx context.Context, namespace, workerPoolName string) ([]PreemptingWorkerPod, error)
+	DeleteWorkerPod(ctx context.Context, namespace, podName string) error
+}
+
 type k8sWorkerPoolScaler struct {
 	baseURL    string
 	tokenPath  string
@@ -163,6 +184,162 @@ func (s *k8sWorkerPoolScaler) GetWorkerPoolStatus(ctx context.Context, namespace
 		SpecReplicas:  payload.Spec.Replicas,
 		ReadyReplicas: payload.Status.ReadyReplicas,
 	}, nil
+}
+
+func (s *k8sWorkerPoolScaler) ListPreemptingWorkers(ctx context.Context, namespace, workerPoolName string) ([]PreemptingWorkerPod, error) {
+	token, err := s.getToken()
+	if err != nil {
+		return nil, err
+	}
+	u := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?labelSelector=%s",
+		s.baseURL,
+		url.PathEscape(namespace),
+		url.QueryEscape("ate.dev/worker-pool="+workerPoolName),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list worker pods: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("list worker pods status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var podList struct {
+		Items []struct {
+			Metadata struct {
+				Name              string `json:"name"`
+				DeletionTimestamp string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+			Spec struct {
+				NodeName string `json:"nodeName"`
+			} `json:"spec"`
+			Status struct {
+				Phase string `json:"phase"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&podList); err != nil {
+		return nil, fmt.Errorf("decode worker pod list: %w", err)
+	}
+
+	var out []PreemptingWorkerPod
+	for _, item := range podList.Items {
+		if item.Status.Phase != "Running" || item.Spec.NodeName == "" {
+			continue
+		}
+		nodeInfo, nodeReason := s.inspectNodePreemption(ctx, token, item.Spec.NodeName)
+		reason := nodeReason
+		if reason == "" && item.Metadata.DeletionTimestamp != "" {
+			reason = "pod-terminating"
+		}
+		if reason != "" {
+			nodeInfo.PodName = item.Metadata.Name
+			nodeInfo.NodeName = item.Spec.NodeName
+			nodeInfo.Reason = reason
+			out = append(out, nodeInfo)
+		}
+	}
+	return out, nil
+}
+
+func (s *k8sWorkerPoolScaler) inspectNodePreemption(ctx context.Context, token, nodeName string) (PreemptingWorkerPod, string) {
+	u := fmt.Sprintf("%s/api/v1/nodes/%s", s.baseURL, url.PathEscape(nodeName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return PreemptingWorkerPod{}, ""
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return PreemptingWorkerPod{}, ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return PreemptingWorkerPod{}, ""
+	}
+
+	var node struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Spec struct {
+			Unschedulable bool `json:"unschedulable"`
+			Taints        []struct {
+				Key string `json:"key"`
+			} `json:"taints"`
+		} `json:"spec"`
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
+		return PreemptingWorkerPod{}, ""
+	}
+
+	info := PreemptingWorkerPod{
+		NodeName:    nodeName,
+		Zone:        node.Metadata.Labels["topology.kubernetes.io/zone"],
+		MachineType: node.Metadata.Labels["node.kubernetes.io/instance-type"],
+		Spot:        node.Metadata.Labels["cloud.google.com/gke-spot"],
+	}
+	for _, cond := range node.Status.Conditions {
+		if (cond.Type == "TerminationNotice" || cond.Type == "Preempted") && cond.Status == "True" {
+			return info, "gce-termination-notice"
+		}
+	}
+	for _, t := range node.Spec.Taints {
+		if t.Key == "cloud.google.com/impending-node-termination" ||
+			t.Key == "ToBeDeletedByClusterAutoscaler" {
+			return info, t.Key
+		}
+	}
+	if node.Spec.Unschedulable {
+		return info, "node-unschedulable-drain"
+	}
+	return info, ""
+}
+
+func (s *k8sWorkerPoolScaler) DeleteWorkerPod(ctx context.Context, namespace, podName string) error {
+	token, err := s.getToken()
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s?gracePeriodSeconds=0",
+		s.baseURL,
+		url.PathEscape(namespace),
+		url.PathEscape(podName),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete worker pod %s/%s: %w", namespace, podName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("delete worker pod %s/%s status %d: %s", namespace, podName, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func (s *k8sWorkerPoolScaler) SetWorkerPoolReplicas(ctx context.Context, namespace, name string, replicas int32) (WorkerPoolStatus, error) {
@@ -574,6 +751,12 @@ type Gateway struct {
 	lastScaleReason   string
 	scaleUpCount      atomic.Uint64
 	scaleDownCount    atomic.Uint64
+
+	evacMu          sync.Mutex
+	evacuatedPods   map[string]time.Time
+	evacuationCount atomic.Uint64
+	lastEvacTime    time.Time
+	lastEvacDetails map[string]any
 }
 
 func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
@@ -621,9 +804,10 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 	if reg == nil && tmplMgr != nil && cfg.ImagePollInterval > 0 {
 		reg = newDockerHubRegistryClient("")
 	}
-	routerClient := http.DefaultClient
+	routerClient := &http.Client{Timeout: 45 * time.Second}
 	if cfg.RouterTLSConfig != nil {
 		routerClient = &http.Client{
+			Timeout: 45 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: cfg.RouterTLSConfig,
 			},
@@ -638,6 +822,7 @@ func NewGateway(cfg GatewayConfig, suspender ActorSuspender) *Gateway {
 		routerHTTPClient: routerClient,
 		worlds:           make(map[string]*WorldTunnel, len(cfg.Routes)),
 		byPort:           make(map[int]*WorldTunnel, len(cfg.Routes)),
+		evacuatedPods:    make(map[string]time.Time),
 	}
 	for _, r := range cfg.Routes {
 		wt := &WorldTunnel{
@@ -1475,6 +1660,10 @@ func (gw *Gateway) idleReaperLoop(ctx context.Context) {
 				}
 			}
 
+			if !allSuspended {
+				gw.checkAndEvacuatePreemptingWorkers(ctx)
+			}
+
 			if allSuspended && !gw.upgradeInProgress.Load() {
 				// Do not scale down WorkerPool if the ActorTemplate's Golden Snapshot is not ready yet!
 				if gw.tmplMgr != nil {
@@ -1570,6 +1759,148 @@ func (wt *WorldTunnel) prepareActorSuspend(ctx context.Context) {
 	slog.Info("Actor prepared for suspend (RCON save)", "actor", wt.spec.ActorRef(), "response", strings.TrimSpace(string(body)))
 }
 
+func (gw *Gateway) checkAndEvacuatePreemptingWorkers(ctx context.Context) {
+	watcher, ok := gw.scaler.(WorkerPreemptionWatcher)
+	if !ok || watcher == nil {
+		return
+	}
+	preempting, err := watcher.ListPreemptingWorkers(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName)
+	if err != nil || len(preempting) == 0 {
+		return
+	}
+	var fresh []PreemptingWorkerPod
+	gw.evacMu.Lock()
+	for _, p := range preempting {
+		if prev, seen := gw.evacuatedPods[p.PodName]; !seen || time.Since(prev) > 2*time.Minute {
+			gw.evacuatedPods[p.PodName] = time.Now()
+			fresh = append(fresh, p)
+		}
+	}
+	gw.evacMu.Unlock()
+	if len(fresh) == 0 {
+		return
+	}
+	_, _ = gw.EvacuatePreemptingWorkers(ctx, fresh, "auto-preemption-watch")
+}
+
+// EvacuatePreemptingWorkers executes a make-before-break evacuation during a
+// 30-second Spot preemption / node drain window:
+//  1. Surges WorkerPool replicas to MaxActiveWorlds+1 at t=0s so GKE
+//     ComputeClass immediately provisions or claims a replacement node.
+//  2. Runs RCON /server-save + SuspendActor on all running worlds to checkpoint
+//     their full gVisor RAM + /factorio saves to GCS (~3s).
+//  3. Deletes the worker pod on the preempting/cordoned node and restores
+//     WorkerPool spec.replicas to MaxActiveWorlds.
+//  4. Immediately transitions the evacuated worlds back to WorldStateResuming
+//     so they rehydrate onto the replacement node as soon as it is Ready.
+func (gw *Gateway) EvacuatePreemptingWorkers(ctx context.Context, pods []PreemptingWorkerPod, trigger string) (map[string]any, error) {
+	start := time.Now()
+	watcher, _ := gw.scaler.(WorkerPreemptionWatcher)
+
+	if len(pods) == 0 && watcher != nil {
+		detected, err := watcher.ListPreemptingWorkers(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName)
+		if err != nil {
+			return nil, err
+		}
+		pods = detected
+	}
+
+	// 1. Make-Before-Break Surge at t=0s: request an extra WorkerPool replica
+	// immediately so Kubernetes schedules a replacement pod while we checkpoint.
+	surgeTarget := int32(gw.cfg.MaxActiveWorlds + 1)
+	if gw.scaler != nil {
+		gw.scaleMu.Lock()
+		if updated, err := gw.scaler.SetWorkerPoolReplicas(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName, surgeTarget); err == nil {
+			gw.workerPoolStatus = updated
+			gw.lastScaleTime = time.Now()
+			gw.lastScaleReason = "preemption-surge:" + trigger
+		}
+		gw.scaleMu.Unlock()
+	}
+
+	// 2. Evacuate all currently RUNNING worlds to GCS (RCON /server-save + SuspendActor).
+	var evacuatedActors []string
+	var resumeTargets []*WorldTunnel
+	for _, wt := range gw.worlds {
+		wt.mu.Lock()
+		st := wt.state
+		wt.mu.Unlock()
+		if st == WorldStateRunning {
+			reason := fmt.Sprintf("spot-preemption:%s", trigger)
+			if len(pods) > 0 {
+				reason = fmt.Sprintf("spot-preemption:%s:%s(%s)", pods[0].NodeName, pods[0].Zone, pods[0].Reason)
+			}
+			slog.Info("Spot Preemption Shield: checkpointing running world to GCS before node termination",
+				"actor", wt.spec.ActorRef(),
+				"reason", reason,
+			)
+			if err := wt.suspendNow(ctx, reason); err == nil {
+				evacuatedActors = append(evacuatedActors, wt.spec.ActorRef())
+				resumeTargets = append(resumeTargets, wt)
+			}
+		}
+	}
+
+	// 3. Delete the old worker pod(s) on the preempting/cordoned node(s) and
+	// restore WorkerPool spec.replicas back to MaxActiveWorlds.
+	var deletedPods []string
+	if watcher != nil {
+		for _, p := range pods {
+			if p.PodName == "" {
+				continue
+			}
+			if err := watcher.DeleteWorkerPod(ctx, gw.cfg.WorkerPoolNamespace, p.PodName); err != nil {
+				slog.Warn("Failed to delete preempting worker pod", "pod", p.PodName, "err", err)
+			} else {
+				deletedPods = append(deletedPods, p.PodName)
+			}
+		}
+	}
+	if gw.scaler != nil {
+		gw.scaleMu.Lock()
+		if updated, err := gw.scaler.SetWorkerPoolReplicas(ctx, gw.cfg.WorkerPoolNamespace, gw.cfg.WorkerPoolName, int32(gw.cfg.MaxActiveWorlds)); err == nil {
+			gw.workerPoolStatus = updated
+			gw.lastScaleTime = time.Now()
+			gw.lastScaleReason = "post-preemption-target:" + trigger
+		}
+		gw.scaleMu.Unlock()
+	}
+
+	// 4. Immediately transition evacuated worlds back to WorldStateResuming so
+	// they reconnect via atenet-router onto the replacement ComputeClass node.
+	for _, wt := range resumeTargets {
+		wt.mu.Lock()
+		wt.state = WorldStateResuming
+		wt.lastStateChange = time.Now()
+		wt.wakeCount.Add(1)
+		tunnelCtx, cancel := context.WithCancel(ctx)
+		wt.wsCancel = cancel
+		wt.mu.Unlock()
+		slog.Info("Spot Preemption Shield: auto-resuming evacuated world onto replacement ComputeClass node",
+			"actor", wt.spec.ActorRef(),
+		)
+		go wt.maintainWebSocketLoop(tunnelCtx)
+	}
+
+	checkpointDuration := time.Since(start)
+	details := map[string]any{
+		"trigger":                trigger,
+		"preempting_workers":     pods,
+		"deleted_worker_pods":    deletedPods,
+		"evacuated_actors":       evacuatedActors,
+		"checkpoint_duration_ms": checkpointDuration.Milliseconds(),
+		"timestamp":              time.Now().UTC().Format(time.RFC3339),
+	}
+
+	gw.evacMu.Lock()
+	gw.evacuationCount.Add(1)
+	gw.lastEvacTime = time.Now()
+	gw.lastEvacDetails = details
+	gw.evacMu.Unlock()
+
+	return details, nil
+}
+
 func (gw *Gateway) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -1584,8 +1915,23 @@ func (gw *Gateway) HTTPHandler() http.Handler {
 	mux.HandleFunc("/world-status", gw.handleWorldStatus)
 	mux.HandleFunc("/suspend", gw.handleManualSuspend)
 	mux.HandleFunc("/scale", gw.handleManualScale)
+	mux.HandleFunc("/evacuate", gw.handleManualEvacuate)
 	mux.HandleFunc("/check-update", gw.handleCheckUpdate)
 	return mux
+}
+
+func (gw *Gateway) handleManualEvacuate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	res, err := gw.EvacuatePreemptingWorkers(r.Context(), nil, "manual-http-evacuate")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 func (gw *Gateway) handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1709,12 +2055,27 @@ func (gw *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		workerPoolMap["last_scale_time"] = lastScaleTime.UTC().Format(time.RFC3339)
 	}
 
+	gw.evacMu.Lock()
+	evacCount := gw.evacuationCount.Load()
+	lastEvacTime := gw.lastEvacTime
+	lastEvacDetails := gw.lastEvacDetails
+	gw.evacMu.Unlock()
+
+	preemptionShield := map[string]any{
+		"evacuation_count": evacCount,
+		"last_evacuation":  lastEvacDetails,
+	}
+	if !lastEvacTime.IsZero() {
+		preemptionShield["last_evacuation_time"] = lastEvacTime.UTC().Format(time.RFC3339)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"idle_timeout":      gw.cfg.IdleTimeout.String(),
 		"max_active_worlds": gw.cfg.MaxActiveWorlds,
 		"auto_update":       autoUpdate,
 		"worker_pool":       workerPoolMap,
+		"preemption_shield": preemptionShield,
 		"worlds":            worlds,
 	})
 }

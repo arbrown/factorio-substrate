@@ -53,40 +53,7 @@ gcloud container clusters update "${CLUSTER_NAME}" \
   --project "${PROJECT_ID}" \
   --autoscaling-profile=optimize-utilization
 
-# 3. Ensure 'substrate-worker-pool' is Spot (0 -> 1 n2-standard-2 Ice Lake, tainted, scale-to-zero).
-if gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  WORKER_IS_SPOT="$(gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(config.spot)' 2>/dev/null || echo "")"
-  if [[ "${WORKER_IS_SPOT}" != "True" ]]; then
-    echo "==> Existing 'substrate-worker-pool' is not Spot. Deleting to recreate as Spot..."
-    gcloud container node-pools delete substrate-worker-pool \
-      --cluster "${CLUSTER_NAME}" \
-      --zone "${CLUSTER_LOCATION}" \
-      --project "${PROJECT_ID}" \
-      --quiet
-  else
-    echo "==> 'substrate-worker-pool' already exists and is Spot"
-  fi
-fi
-
-if ! gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  MAX_WORKER_NODES="${MAX_WORKER_NODES:-1}"
-  echo "==> Creating Spot 'substrate-worker-pool' (0 -> ${MAX_WORKER_NODES} n2-standard-2 Ice Lake, scale-to-zero)..."
-  gcloud container node-pools create substrate-worker-pool \
-    --cluster "${CLUSTER_NAME}" \
-    --zone "${CLUSTER_LOCATION}" \
-    --project "${PROJECT_ID}" \
-    --spot \
-    --machine-type=n2-standard-2 \
-    --min-cpu-platform="Intel Ice Lake" \
-    --disk-size=50GB \
-    --disk-type=pd-balanced \
-    --enable-autoscaling \
-    --min-nodes=0 \
-    --max-nodes="${MAX_WORKER_NODES}" \
-    --node-taints="ate.dev/sandboxClass=gvisor:NoSchedule"
-fi
-
-# 4. Ensure 'control-pool' is Spot (1x e2-medium, 30GB pd-standard).
+# 3. Ensure 'control-pool' is Spot (1x e2-medium, 30GB pd-standard) pinned to us-central1-a.
 if gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
   CONTROL_IS_SPOT="$(gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(config.spot)' 2>/dev/null || echo "")"
   if [[ "${CONTROL_IS_SPOT}" != "True" ]]; then
@@ -98,7 +65,7 @@ if gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}"
       --project "${PROJECT_ID}" \
       --quiet
 
-    echo "    Recreating Spot 'control-pool' (1x e2-medium)..."
+    echo "    Recreating Spot 'control-pool' (1x e2-medium in ${CLUSTER_LOCATION})..."
     gcloud container node-pools create control-pool \
       --cluster "${CLUSTER_NAME}" \
       --zone "${CLUSTER_LOCATION}" \
@@ -108,6 +75,7 @@ if gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}"
       --disk-size=30GB \
       --disk-type=pd-standard \
       --num-nodes=1 \
+      --node-locations="${CLUSTER_LOCATION}" \
       --tags=factorio-gateway-node \
       --no-enable-autoupgrade
 
@@ -115,10 +83,16 @@ if gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}"
     kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=300s
     kubectl rollout status deployment/ate-api-server -n ate-system --timeout=180s
   else
-    echo "==> 'control-pool' already exists and is Spot"
+    echo "==> 'control-pool' already exists and is Spot; ensuring it is pinned to ${CLUSTER_LOCATION}..."
+    gcloud container node-pools update control-pool \
+      --cluster "${CLUSTER_NAME}" \
+      --zone "${CLUSTER_LOCATION}" \
+      --project "${PROJECT_ID}" \
+      --node-locations="${CLUSTER_LOCATION}" \
+      --quiet || true
   fi
 else
-  echo "==> Creating Spot 'control-pool' (1x e2-medium, 30GB pd-standard)..."
+  echo "==> Creating Spot 'control-pool' (1x e2-medium, 30GB pd-standard in ${CLUSTER_LOCATION})..."
   gcloud container node-pools create control-pool \
     --cluster "${CLUSTER_NAME}" \
     --zone "${CLUSTER_LOCATION}" \
@@ -128,6 +102,7 @@ else
     --disk-size=30GB \
     --disk-type=pd-standard \
     --num-nodes=1 \
+    --node-locations="${CLUSTER_LOCATION}" \
     --tags=factorio-gateway-node \
     --no-enable-autoupgrade
 
@@ -135,6 +110,75 @@ else
   kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=300s
   kubectl rollout status deployment/ate-api-server -n ate-system --timeout=180s
 fi
+
+# 4. Remove legacy single-zone 'substrate-worker-pool' if present and enable full-region
+#    multi-zone locations (us-central1-a,b,c,f) for ComputeClass 'factorio-substrate-worker'.
+if gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "==> Deleting legacy single-zone 'substrate-worker-pool' in favor of ComputeClass 'factorio-substrate-worker'..."
+  gcloud container node-pools delete substrate-worker-pool \
+    --cluster "${CLUSTER_NAME}" \
+    --zone "${CLUSTER_LOCATION}" \
+    --project "${PROJECT_ID}" \
+    --quiet || true
+fi
+
+REGION_ZONES="${REGION_ZONES:-us-central1-a,us-central1-b,us-central1-c,us-central1-f}"
+echo "==> Enabling multi-zone node locations (${REGION_ZONES}) on cluster '${CLUSTER_NAME}'..."
+gcloud container clusters update "${CLUSTER_NAME}" \
+  --zone "${CLUSTER_LOCATION}" \
+  --project "${PROJECT_ID}" \
+  --node-locations="${REGION_ZONES}" \
+  --quiet
+
+echo "==> Pinning 'control-pool' back to single zone (${CLUSTER_LOCATION}) so it stays at 1 node..."
+gcloud container node-pools update control-pool \
+  --cluster "${CLUSTER_NAME}" \
+  --zone "${CLUSTER_LOCATION}" \
+  --project "${PROJECT_ID}" \
+  --node-locations="${CLUSTER_LOCATION}" \
+  --quiet
+
+echo "==> Applying ComputeClass 'factorio-substrate-worker' (Spot n2-standard-2 -> Spot n2-standard-4 -> On-Demand n2-standard-2 across all zones)..."
+cat <<'EOF' | kubectl apply -f -
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: factorio-substrate-worker
+spec:
+  description: "Multi-zone Spot-first cascade with On-Demand fallback for Factorio Agent Substrate workers"
+  whenUnsatisfiable: ScaleUpAnyway
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: true
+  priorityDefaults:
+    location:
+      zones:
+      - us-central1-a
+      - us-central1-b
+      - us-central1-c
+      - us-central1-f
+      locationPolicy: ANY
+  priorities:
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  - machineType: n2-standard-4
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: false
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+EOF
 
 # Ensure GCP Firewall Rule allows UDP hostPorts (34197-34297).
 echo "==> Ensuring GCP Firewall Rule allows UDP hostPorts (34197-34297)..."

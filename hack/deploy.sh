@@ -118,20 +118,6 @@ sys.stdout.write(tmpl)
   | kubectl apply -f -
 
 echo "==> Ensuring WorkerPool has ${MAX_ACTIVE_WORLDS} replica(s) during deployment..."
-if [[ "${RESIZE_NODEPOOL:-true}" == "true" ]] && [[ -n "${CLUSTER_NAME:-}" ]] && [[ -n "${CLUSTER_LOCATION:-}" ]]; then
-  CURRENT_MAX_NODES="$(gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(autoscaling.maxNodeCount)' 2>/dev/null || echo "")"
-  if [[ -n "${CURRENT_MAX_NODES}" && "${CURRENT_MAX_NODES}" != "${MAX_ACTIVE_WORLDS}" ]]; then
-    echo "    Updating 'substrate-worker-pool' autoscaling max-nodes (${CURRENT_MAX_NODES} -> ${MAX_ACTIVE_WORLDS})..."
-    gcloud container node-pools update substrate-worker-pool \
-      --cluster "${CLUSTER_NAME}" \
-      --zone "${CLUSTER_LOCATION}" \
-      --project "${PROJECT_ID}" \
-      --enable-autoscaling \
-      --min-nodes=0 \
-      --max-nodes="${MAX_ACTIVE_WORLDS}" \
-      --quiet || true
-  fi
-fi
 kubectl patch workerpool factorio -n factorio --type=merge -p "{\"spec\":{\"replicas\":${MAX_ACTIVE_WORLDS}}}" || true
 
 echo "==> Waiting for WorkerPool and UDP Gateway to roll out..."
@@ -174,13 +160,11 @@ if run_kubectl_ate get actor-template factorio-server -a factorio >/dev/null 2>&
   TMPL_JSON="$(run_kubectl_ate get actor-template factorio-server -a factorio -o json)"
   SNAP_URI="$(echo "${TMPL_JSON}" | jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty')"
   CUR_FACTORIO_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="factorio") | .image // empty')"
-  CUR_SIDECAR_IMAGE="$(echo "${TMPL_JSON}" | jq -r '.containers[] | select(.name=="sidecar") | .image // empty')"
-  if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" || "${CUR_SIDECAR_IMAGE}" != "${NEW_SIDECAR_IMAGE}" || "${RECREATE_TEMPLATE:-false}" == "true" ]]; then
+  if [[ -z "${SNAP_URI}" || "${CUR_FACTORIO_IMAGE}" != "${FACTORIO_IMAGE}" || "${RECREATE_TEMPLATE:-false}" == "true" ]]; then
     OLD_UID="$(echo "${TMPL_JSON}" | jq -r '.metadata.uid // empty')"
     echo "    Recreating factorio-server ActorTemplate (factorio=${FACTORIO_IMAGE}, sidecar=${NEW_SIDECAR_IMAGE})..."
     for ACTOR in "${WORLDS[@]}"; do
       run_kubectl_ate suspend actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
-      run_kubectl_ate delete actor "${ACTOR}" -a factorio >/dev/null 2>&1 || true
     done
     run_kubectl_ate delete actor-template factorio-server -a factorio || true
     if [[ -n "${OLD_UID}" ]]; then

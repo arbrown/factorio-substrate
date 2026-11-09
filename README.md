@@ -52,14 +52,17 @@ By default, we deploy:
 
 Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198`, `:34199`, or `:34200` while another world is idle automatically triggers an RCON `/server-save` on the active world, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores the requested world into the exact same worker pod in ~1.4 seconds!
 
-### Scale-to-Zero Architecture ("Option A" with Spot VMs & hostPort)
-For personal/home use, keeping worker nodes running 24/7 or paying for cloud LoadBalancers is wasteful. We implement **Option A Scale-to-Zero with Spot VMs and hostPort ingress**, minimizing cluster footprint and operational overhead:
-1. **Always-On Spot Control Plane (`control-pool`):** 1x `e2-medium` Spot node (30GB pd-standard). Runs the Substrate control plane (`ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, `podcertificate-controller`), `factorio-gateway`, and `postgres-0` (right-sized from 500Gi to 10Gi).
-2. **On-Demand Spot Worker Node Pool (`substrate-worker-pool`):** `0 -> 1` autoscaling `n2-standard-2` Spot node (Intel Ice Lake, 50GB pd-balanced, tainted `ate.dev/sandboxClass=gvisor:NoSchedule`). Scales down to 0 nodes when idle and provisions on demand.
-3. **Direct `hostPort` Ingress (Arbitrary Maps):** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`factorio-ate-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to `WORLDS` in `hack/deploy.sh` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits.
-4. **Gateway Ingress Cold Wake:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. GKE Cluster Autoscaler provisions the node in ~60–90 seconds while the gateway handles connection retries.
-5. **Automatic Scale-to-Zero:** When all worlds are suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0`. GKE Cluster Autoscaler (`--autoscaling-profile=optimize-utilization`) then shuts down the worker node ~2 minutes later.
-6. **Run Cost Optimization:**
+### Scale-to-Zero & Multi-Zone Spot Cascade Architecture ("Option A" + `ComputeClass`)
+For personal/home use, keeping worker nodes running 24/7 or paying for cloud LoadBalancers is wasteful. We implement **Option A Scale-to-Zero with Spot VMs, a multi-zone GKE `ComputeClass` cascade, and hostPort ingress**, minimizing cluster footprint and operational overhead:
+1. **Always-On Spot Control Plane (`control-pool`):** 1x `e2-medium` Spot node (30GB pd-standard) pinned to `us-central1-a`. Runs the Substrate control plane (`ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, `podcertificate-controller`), `factorio-gateway`, and `postgres-0` (right-sized from 500Gi to 10Gi).
+2. **Multi-Zone GKE `ComputeClass` Worker Cascade (`factorio-substrate-worker`):** `0 -> N` autoscaling across all 4 zones in `us-central1` (`us-central1-a`, `us-central1-b`, `us-central1-c`, `us-central1-f`) with `locationPolicy: ANY`, `activeMigration.optimizeRulePriority: true`, and `minCpuPlatform: "Intel Ice Lake"` across every tier so gVisor memory checkpoints remain CPUID-compatible:
+   - **Priority 1:** Spot `n2-standard-2` (Intel Ice Lake) in any zone
+   - **Priority 2:** Spot `n2-standard-4` (Intel Ice Lake) in any zone if `n2-standard-2` Spot is stocked out
+   - **Priority 3:** On-Demand `n2-standard-2` (Intel Ice Lake) fallback if Spot is stocked out region-wide
+3. **30-Second Spot Preemption Shield (`EvacuatePreemptingWorkers`):** `factorio-gateway` watches worker nodes every 1s for `cloud.google.com/impending-node-termination` / `TerminationNotice` / unschedulable cordons. When triggered, it immediately surges `WorkerPool` `spec.replicas` to `MaxActiveWorlds+1`, checkpoints running worlds to GCS via RCON `/server-save` + `SuspendActor` (~2.5–3.5s, comfortably inside GCE's 30s termination grace window), force-deletes the dying worker pod, and auto-resumes onto the replacement `ComputeClass` node with zero item or save loss.
+4. **Direct `hostPort` Ingress (Arbitrary Maps):** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`factorio-ate-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to `WORLDS` in `hack/deploy.sh` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits.
+5. **Gateway Ingress Cold Wake & Automatic Scale-to-Zero:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. When all worlds remain suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0` so GKE NAP reclaims worker nodes to zero.
+6. **Run Cost Optimization / Cluster Setup:**
    ```bash
    make optimize-cluster   # Runs ./hack/setup-cost-optimized-pools.sh
    ```
@@ -83,6 +86,7 @@ Because Steam auto-updates players' Factorio clients whenever Wube releases a ne
 - [`hack/deploy.sh`](hack/deploy.sh) — Builds images with `ko`, applies manifests, dynamically resolves the latest `factoriotools/factorio:stable` digest, registers `factorio-server`, and creates `world-vanilla` and `world-deathworld`.
 - [`hack/test-e2e.sh`](hack/test-e2e.sh) — Automated end-to-end verification script testing wake-on-UDP, RCON status, multi-world multiplexing on the single worker pod, and idle auto-suspend.
 - [`hack/prove-e2e.sh`](hack/prove-e2e.sh) — Full stateful proof that spawns a `steel-chest` with `42` `automation-science-pack`s at `(0.5, 0.5)` on `nauvis` via RCON Lua, multiplexes to `world-deathworld` (evicting `world-vanilla` to GCS), wakes `world-vanilla` back up from GCS, and verifies the chest and all 42 science packs survived.
+- [`hack/test-spot-cascade-preemption.sh`](hack/test-spot-cascade-preemption.sh) — Live 2-hop Spot preemption cascade simulation (`make test-preemption`) verifying GCS evacuation within GCE's 30s grace period, cold vs. warm standby failover timing, and zero item loss via RCON Lua.
 - [`hack/watch-actors.sh`](hack/watch-actors.sh) — Live terminal dashboard (`make watch`) and transition logger (`make watch-transitions`) showing Actor states, WorkerPool pod assignments, GCS snapshot URIs, and gateway UDP counters.
 - [`TRADEOFFS.md`](TRADEOFFS.md) — Explicit record of all architectural trade-offs and design decisions.
 
@@ -141,6 +145,9 @@ make prove
 
 # Trigger an immediate Docker Hub check & ActorTemplate upgrade check on factorio-gateway:
 make check-update
+
+# Simulate a 2-hop GCE Spot preemption cascade (cold ComputeClass replacement + warm standby):
+make test-preemption
 ```
 
 To also verify the automatic idle-timeout RCON save + suspend cycle using a shortened 30-second timeout (and automatically restore the 10-minute timeout afterward):
