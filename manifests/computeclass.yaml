@@ -1,0 +1,61 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Multi-zone Spot-first ComputeClass cascade with On-Demand fallback for Factorio
+# worker pods (`whenUnsatisfiable: ScaleUpAnyway`). Every priority enforces
+# `minCpuPlatform: "Intel Ice Lake"` so gVisor full-memory snapshots stay
+# CPUID-compatible across zone/machine fallbacks.
+# Note: `make computeclass` updates `spec.priorityDefaults.location.zones` from
+# WORKER_ZONES in `.env` when overridden.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: factorio-substrate-worker
+spec:
+  description: "Multi-zone Spot-first cascade with On-Demand fallback for Factorio Agent Substrate workers"
+  whenUnsatisfiable: ScaleUpAnyway
+  nodePoolAutoCreation:
+    enabled: true
+  activeMigration:
+    optimizeRulePriority: true
+  priorityDefaults:
+    location:
+      zones:
+      - us-central1-a
+      - us-central1-b
+      - us-central1-c
+      - us-central1-f
+      locationPolicy: ANY
+  priorities:
+  # Priority 1: Spot n2-standard-2 (Intel Ice Lake) across ANY zone
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  # Priority 2: Spot n2-standard-4 (Intel Ice Lake) across ANY zone
+  - machineType: n2-standard-4
+    minCpuPlatform: "Intel Ice Lake"
+    spot: true
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50
+  # Priority 3: On-Demand n2-standard-2 (Intel Ice Lake) fallback if Spot is stocked out region-wide
+  - machineType: n2-standard-2
+    minCpuPlatform: "Intel Ice Lake"
+    spot: false
+    storage:
+      bootDiskType: pd-balanced
+      bootDiskSize: 50

@@ -2,8 +2,14 @@
 .worktree/
 
 # Local environment overrides and credentials
+.env
+.env.*
+!.env.example
 .ate-dev-env.sh
 *.kubeconfig
+
+# Generated per-project state and downloaded tools
+.state/
 
 # Built binaries and artifacts
 bin/

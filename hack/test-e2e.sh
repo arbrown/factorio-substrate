@@ -14,86 +14,60 @@
 # limitations under the License.
 
 # End-to-end verification of Factorio on Agent Substrate:
-#   1. Resolves the external LoadBalancer IP of factorio-gateway.
-#   2. Ensures both world-vanilla and world-deathworld start SUSPENDED.
-#   3. Sends a real Factorio 2.x UDP ConnectionRequest probe to :34197
-#      (world-vanilla) and verifies that it wakes the Actor and returns a
-#      genuine Factorio UDP ConnectionRequestReply.
-#   4. Queries RCON status via /world-status to verify live Factorio game state.
-#   5. Connects to :34198 (world-deathworld) and verifies that the single
-#      WorkerPool pod multiplexes: suspending world-vanilla to GCS and
-#      resuming world-deathworld.
-#   6. Waits for the idle timeout and verifies that world-deathworld
-#      automatically saves and suspends back to ACTOR_STATE_SUSPENDED.
+#   1. Resolves the external IP of factorio-gateway (Node ExternalIP / hostPort).
+#   2. Ensures Actor state reporting and wakes world-vanilla via UDP (:34197).
+#   3. Queries RCON status via /world-status to verify live Factorio game state.
+#   4. Connects to :34198 (world-deathworld) and verifies single-worker
+#      multiplexing: suspending world-vanilla to GCS and resuming world-deathworld.
+#   5. Optionally waits for idle auto-suspend back to ACTOR_STATE_SUSPENDED.
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+load_env
+ensure_kubectl_ate
+resolve_worlds
 
-set -euo pipefail
+step "Resolving factorio-gateway External IP (hostPort / Node IP)"
+gw_external_ip 60 || die "timed out waiting for factorio-gateway ExternalIP"
+ok "EXTERNAL_IP=${EXTERNAL_IP} (node=${GW_NODE})"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
-
-if [[ -f .ate-dev-env.sh ]]; then
-  source .ate-dev-env.sh
-fi
-
-SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
-
-run_kubectl_ate() {
-  (cd "${SUBSTRATE_REPO}" && go run ./cmd/kubectl-ate "$@")
-}
-
-echo "==> Resolving factorio-gateway External IP (hostPort / Node IP)..."
-EXTERNAL_IP=""
-for i in {1..60}; do
-  GW_NODE="$(kubectl get pod -n factorio -l app=factorio-gateway -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
-  if [[ -n "${GW_NODE}" ]]; then
-    EXTERNAL_IP="$(kubectl get node "${GW_NODE}" -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || true)"
-  fi
-  if [[ -z "${EXTERNAL_IP}" ]]; then
-    EXTERNAL_IP="$(kubectl get svc -n factorio factorio-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-  fi
-  if [[ -n "${EXTERNAL_IP}" ]]; then
-    break
-  fi
-  sleep 3
-done
-if [[ -z "${EXTERNAL_IP}" ]]; then
-  echo "error: timed out waiting for factorio-gateway EXTERNAL-IP" >&2
-  exit 1
-fi
-echo "    EXTERNAL_IP=${EXTERNAL_IP} (node=${GW_NODE:-unknown})"
-
-echo "==> Starting port-forward to factorio-gateway-http (:18080 -> :8080)..."
-kubectl port-forward -n factorio svc/factorio-gateway-http 18080:8080 >/dev/null 2>&1 &
+PF_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+kubectl port-forward -n "${NAMESPACE}" svc/factorio-gateway-http "${PF_PORT}:8080" >/dev/null 2>&1 &
 PF_PID=$!
 trap 'kill "${PF_PID}" >/dev/null 2>&1 || true' EXIT
-sleep 2
 
-echo "==> Step 1: Checking initial Actor states..."
-run_kubectl_ate get actor -a factorio
+pf_ready() {
+  [[ "$(curl -fsS --max-time 2 "http://127.0.0.1:${PF_PORT}/healthz" 2>/dev/null || true)" == "ok" ]]
+}
+wait_for 30 "port-forward to factorio-gateway-http on :${PF_PORT}" pf_ready
 
-echo "==> Step 2: Probing world-vanilla on ${EXTERNAL_IP}:34197/UDP..."
-go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34197" --timeout=180s
+step "Step 1: Checking initial Actor states"
+run_kubectl_ate get actor -a "${ATESPACE}"
 
-echo "==> Step 3: Verifying world-vanilla is RUNNING and querying RCON status..."
-run_kubectl_ate get actor world-vanilla -a factorio
-curl -fsS "http://127.0.0.1:18080/world-status?actor=factorio/world-vanilla" && echo ""
-curl -fsS "http://127.0.0.1:18080/status" && echo ""
+PORT_VANILLA="${BASE_UDP_PORT}"
+PORT_DEATHWORLD="$((BASE_UDP_PORT + 1))"
 
-echo "==> Step 4: Waiting 6s (preempt grace) then probing world-deathworld on ${EXTERNAL_IP}:34198/UDP to test single-worker multiplexing..."
+step "Step 2: Probing world-vanilla on ${EXTERNAL_IP}:${PORT_VANILLA}/UDP"
+go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:${PORT_VANILLA}" --timeout=180s
+
+step "Step 3: Verifying world-vanilla is RUNNING and querying RCON status"
+run_kubectl_ate get actor world-vanilla -a "${ATESPACE}"
+curl -fsS "http://127.0.0.1:${PF_PORT}/world-status?actor=${ATESPACE}/world-vanilla" && echo ""
+curl -fsS "http://127.0.0.1:${PF_PORT}/status" && echo ""
+
+step "Step 4: Waiting 6s (preempt grace) then probing world-deathworld on ${EXTERNAL_IP}:${PORT_DEATHWORLD}/UDP"
 sleep 6
-go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:34198" --timeout=60s
+go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:${PORT_DEATHWORLD}" --timeout=120s
 
-echo "==> Step 5: Verifying world-vanilla was suspended and world-deathworld is now RUNNING..."
-run_kubectl_ate get actor -a factorio
-curl -fsS "http://127.0.0.1:18080/world-status?actor=factorio/world-deathworld" && echo ""
-curl -fsS "http://127.0.0.1:18080/status" && echo ""
+step "Step 5: Verifying world-vanilla was suspended and world-deathworld is RUNNING"
+run_kubectl_ate get actor -a "${ATESPACE}"
+curl -fsS "http://127.0.0.1:${PF_PORT}/world-status?actor=${ATESPACE}/world-deathworld" && echo ""
+curl -fsS "http://127.0.0.1:${PF_PORT}/status" && echo ""
 
 if [[ "${VERIFY_IDLE_SUSPEND:-false}" == "true" ]]; then
   WAIT_SECS="${IDLE_WAIT_SECS:-45}"
-  echo "==> Step 6: Waiting ${WAIT_SECS}s for zero-UDP idle auto-suspend..."
+  step "Step 6: Waiting ${WAIT_SECS}s for zero-UDP idle auto-suspend"
   sleep "${WAIT_SECS}"
-  run_kubectl_ate get actor -a factorio
-  curl -fsS "http://127.0.0.1:18080/status" && echo ""
+  run_kubectl_ate get actor -a "${ATESPACE}"
+  curl -fsS "http://127.0.0.1:${PF_PORT}/status" && echo ""
 fi
 
-echo "==> End-to-End Factorio on Agent Substrate test PASSED!"
+ok "End-to-End Factorio on Agent Substrate test PASSED"
