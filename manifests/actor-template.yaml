@@ -13,7 +13,10 @@
 # limitations under the License.
 
 # ActorTemplate (protojson-shaped ateapi.ActorTemplate) for Factorio on
-# Agent Substrate. Applied via `kubectl ate create actor-template -f -`.
+# Agent Substrate. Built with `ko resolve` and applied via `make actor-template`
+# (or `kubectl ate create actor-template -f -`).
+# IMPORTANT: Only `${FACTORIO_IMAGE}` is substituted (`envsubst '${FACTORIO_IMAGE}'`);
+# the embedded container shell script uses `${VAR}` variables evaluated at runtime.
 metadata:
   atespace: factorio
   name: factorio-server

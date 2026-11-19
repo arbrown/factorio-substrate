@@ -342,9 +342,11 @@ func TestGatewayProactiveAndReactiveAutoUpgrade(t *testing.T) {
 }
 
 type fakeWorkerPoolScaler struct {
-	mu         sync.Mutex
-	status     WorkerPoolStatus
-	scaleCalls []int32
+	mu          sync.Mutex
+	status      WorkerPoolStatus
+	scaleCalls  []int32
+	preempting  []PreemptingWorkerPod
+	deletedPods []string
 }
 
 func (s *fakeWorkerPoolScaler) GetWorkerPoolStatus(_ context.Context, _, _ string) (WorkerPoolStatus, error) {
@@ -360,6 +362,19 @@ func (s *fakeWorkerPoolScaler) SetWorkerPoolReplicas(_ context.Context, _, _ str
 	s.status.SpecReplicas = replicas
 	s.status.ReadyReplicas = replicas
 	return s.status, nil
+}
+
+func (s *fakeWorkerPoolScaler) ListPreemptingWorkers(_ context.Context, _, _ string) ([]PreemptingWorkerPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]PreemptingWorkerPod(nil), s.preempting...), nil
+}
+
+func (s *fakeWorkerPoolScaler) DeleteWorkerPod(_ context.Context, _, podName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletedPods = append(s.deletedPods, podName)
+	return nil
 }
 
 func (s *fakeWorkerPoolScaler) calls() []int32 {
@@ -657,5 +672,184 @@ func TestGatewayRouterTLSAndV1WorkerPoolScaler(t *testing.T) {
 	mu.Unlock()
 	if !gotWS || !gotPrep {
 		t.Fatalf("expected both WebSocket (%v) and prepare-suspend (%v) to use TLS", gotWS, gotPrep)
+	}
+}
+
+func TestGatewaySpotPreemptionShieldMakeBeforeBreak(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+	routerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/prepare-suspend" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"save_output":"Saved"}`))
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			mt, frame, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			clientAddr, payload, err := tunnelproto.DecodeFrame(frame)
+			if err != nil {
+				continue
+			}
+			replyFrame, _ := tunnelproto.EncodeFrame(clientAddr, append([]byte("resumed:"), payload...))
+			_ = ws.WriteMessage(mt, replyFrame)
+		}
+	}))
+	defer routerSrv.Close()
+
+	routerHost := strings.TrimPrefix(routerSrv.URL, "http://")
+	suspender := &fakeSuspender{
+		tmplInfo: TemplateSnapshotInfo{
+			UID:         "uid-1",
+			ImageRef:    "factorio:latest",
+			SnapshotURI: "gs://bucket/golden-1",
+		},
+	}
+	scaler := &fakeWorkerPoolScaler{
+		status: WorkerPoolStatus{SpecReplicas: 1, ReadyReplicas: 1},
+	}
+
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:             "127.0.0.1",
+		RouterHTTPAddr:        routerHost,
+		IdleTimeout:           10 * time.Second,
+		WSRotateInterval:      10 * time.Second,
+		MaxActiveWorlds:       1,
+		WorkerPoolNamespace:   "factorio",
+		WorkerPoolName:        "factorio",
+		WorkerPoolIdleTimeout: 10 * time.Second,
+		Scaler:                scaler,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := gw.Start(ctx); err != nil {
+		t.Fatalf("gw.Start failed: %v", err)
+	}
+	defer gw.Close()
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Wake world-vanilla.
+	probe := tunnelproto.BuildFactorioProbePacket(321)
+	_, _ = clientConn.WriteToUDP(probe, vanillaWT.LocalUDPAddr().(*net.UDPAddr))
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	if _, _, err := clientConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("initial ReadFromUDP failed: %v", err)
+	}
+
+	// Simulate a Spot preemption notice on the node hosting factorio-pod-a in us-central1-a.
+	scaler.mu.Lock()
+	scaler.preempting = []PreemptingWorkerPod{
+		{
+			PodName:     "factorio-pod-a",
+			NodeName:    "gke-spot-node-a",
+			Zone:        "us-central1-a",
+			MachineType: "n2-standard-2",
+			Spot:        "true",
+			Reason:      "gce-termination-notice",
+		},
+	}
+	scaler.mu.Unlock()
+
+	evacReq := httptest.NewRequest(http.MethodPost, "/evacuate", nil)
+	evacRec := httptest.NewRecorder()
+	gw.HTTPHandler().ServeHTTP(evacRec, evacReq)
+	if evacRec.Code != http.StatusOK {
+		t.Fatalf("/evacuate failed: code=%d body=%s", evacRec.Code, evacRec.Body.String())
+	}
+
+	// Verify make-before-break surge (1 -> 2 -> 1), SuspendActor, pod deletion, and auto-resume!
+	calls := scaler.calls()
+	if len(calls) < 2 || calls[len(calls)-2] != 2 || calls[len(calls)-1] != 1 {
+		t.Fatalf("expected make-before-break surge [..., 2, 1], got %v", calls)
+	}
+	if suspended := suspender.list(); len(suspended) != 1 || suspended[0] != "factorio/world-vanilla" {
+		t.Fatalf("expected world-vanilla to be checkpointed on preemption, got %v", suspended)
+	}
+	scaler.mu.Lock()
+	deleted := append([]string(nil), scaler.deletedPods...)
+	scaler.mu.Unlock()
+	if len(deleted) != 1 || deleted[0] != "factorio-pod-a" {
+		t.Fatalf("expected preempting worker pod factorio-pod-a to be deleted, got %v", deleted)
+	}
+
+	// Verify world-vanilla automatically resumed and responds to UDP traffic on the replacement node!
+	_, _ = clientConn.WriteToUDP(probe, vanillaWT.LocalUDPAddr().(*net.UDPAddr))
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := clientConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("post-evacuation ReadFromUDP failed: %v", err)
+	}
+}
+
+func TestGatewayDropsLinkLocalAndDNSPackets(t *testing.T) {
+	suspender := &fakeSuspender{}
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:          "127.0.0.1",
+		RouterHTTPAddr:     "127.0.0.1:1",
+		IdleTimeout:        10 * time.Second,
+		WSRotateInterval:   10 * time.Second,
+		PreemptIdleGrace:   50 * time.Millisecond,
+		MaxActiveWorlds:    1,
+		RequireFactorioPkt: false,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	probe := tunnelproto.BuildFactorioProbePacket(777)
+	ignoredAddrs := []*net.UDPAddr{
+		{IP: net.IPv4(169, 254, 169, 254), Port: 53},
+		{IP: net.IPv4(169, 254, 42, 1), Port: 51234},
+		{IP: net.ParseIP("::ffff:169.254.169.254"), Port: 51234},
+		{IP: net.IPv4(8, 8, 8, 8), Port: 53},
+	}
+
+	for _, addr := range ignoredAddrs {
+		// Send twice in a row to cover both IsLikelyFactorioClientPacket and the
+		// 2-packet burstTracker path.
+		vanillaWT.handleInboundUDP(ctx, addr, probe)
+		vanillaWT.handleInboundUDP(ctx, addr, probe)
+	}
+
+	if got, want := vanillaWT.scannerDropped.Load(), uint64(len(ignoredAddrs)*2); got != want {
+		t.Fatalf("scannerDropped = %d, want %d", got, want)
+	}
+	if got := vanillaWT.wakeCount.Load(); got != 0 {
+		t.Fatalf("wakeCount = %d, want 0", got)
+	}
+	if got := vanillaWT.packetsRx.Load(); got != 0 {
+		t.Fatalf("packetsRx = %d, want 0", got)
+	}
+	vanillaWT.mu.Lock()
+	state := vanillaWT.state
+	clients := len(vanillaWT.clientAddrs)
+	vanillaWT.mu.Unlock()
+	if state != WorldStateSuspended {
+		t.Fatalf("state = %q, want %q", state, WorldStateSuspended)
+	}
+	if clients != 0 {
+		t.Fatalf("len(clientAddrs) = %d, want 0", clients)
 	}
 }

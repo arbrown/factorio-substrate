@@ -52,17 +52,24 @@ By default, we deploy:
 
 Connecting to `:34197` wakes `world-vanilla` into the warm worker pod. Connecting to `:34198`, `:34199`, or `:34200` while another world is idle automatically triggers an RCON `/server-save` on the active world, snapshots its memory + `/factorio` directory to GCS (`gs://<BUCKET_NAME>`), and restores the requested world into the exact same worker pod in ~1.4 seconds!
 
-### Scale-to-Zero Architecture ("Option A" with Spot VMs & hostPort)
-For personal/home use, keeping worker nodes running 24/7 or paying for cloud LoadBalancers is wasteful. We implement **Option A Scale-to-Zero with Spot VMs and hostPort ingress**, minimizing cluster footprint and operational overhead:
-1. **Always-On Spot Control Plane (`control-pool`):** 1x `e2-medium` Spot node (30GB pd-standard). Runs the Substrate control plane (`ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, `podcertificate-controller`), `factorio-gateway`, and `postgres-0` (right-sized from 500Gi to 10Gi).
-2. **On-Demand Spot Worker Node Pool (`substrate-worker-pool`):** `0 -> 1` autoscaling `n2-standard-2` Spot node (Intel Ice Lake, 50GB pd-balanced, tainted `ate.dev/sandboxClass=gvisor:NoSchedule`). Scales down to 0 nodes when idle and provisions on demand.
-3. **Direct `hostPort` Ingress (Arbitrary Maps):** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`factorio-ate-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to `WORLDS` in `hack/deploy.sh` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits.
-4. **Gateway Ingress Cold Wake:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. GKE Cluster Autoscaler provisions the node in ~60–90 seconds while the gateway handles connection retries.
-5. **Automatic Scale-to-Zero:** When all worlds are suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0`. GKE Cluster Autoscaler (`--autoscaling-profile=optimize-utilization`) then shuts down the worker node ~2 minutes later.
-6. **Run Cost Optimization:**
+### Scale-to-Zero & Multi-Zone Spot Cascade Architecture ("Option A" + `ComputeClass`)
+For personal/home use, keeping worker nodes running 24/7 or paying for cloud LoadBalancers is wasteful. We implement **Option A Scale-to-Zero with Spot VMs, a multi-zone GKE `ComputeClass` cascade, and hostPort ingress**, minimizing cluster footprint and operational overhead:
+1. **Always-On Spot Control Plane (`control-pool`):** 1x `e2-medium` Spot node (30GB pd-standard) pinned to `us-central1-a`. Runs the Substrate control plane (`ate-api-server`, `ate-controller`, `atenet-router`, `atenet-egress`, `podcertificate-controller`), `factorio-gateway`, and `postgres-0` (right-sized from 500Gi to 10Gi).
+2. **Multi-Zone GKE `ComputeClass` Worker Cascade (`factorio-substrate-worker`):** `0 -> N` autoscaling across all 4 zones in `us-central1` (`us-central1-a`, `us-central1-b`, `us-central1-c`, `us-central1-f`) with `locationPolicy: ANY`, `activeMigration.optimizeRulePriority: true`, and `minCpuPlatform: "Intel Ice Lake"` across every tier so gVisor memory checkpoints remain CPUID-compatible:
+   - **Priority 1:** Spot `n2-standard-2` (Intel Ice Lake) in any zone
+   - **Priority 2:** Spot `n2-standard-4` (Intel Ice Lake) in any zone if `n2-standard-2` Spot is stocked out
+   - **Priority 3:** On-Demand `n2-standard-2` (Intel Ice Lake) fallback if Spot is stocked out region-wide
+3. **30-Second Spot Preemption Shield (`EvacuatePreemptingWorkers`):** `factorio-gateway` watches worker nodes every 1s for `cloud.google.com/impending-node-termination` / `TerminationNotice` / unschedulable cordons. When triggered, it immediately surges `WorkerPool` `spec.replicas` to `MaxActiveWorlds+1`, checkpoints running worlds to GCS via RCON `/server-save` + `SuspendActor` (~2.5–3.5s, comfortably inside GCE's 30s termination grace window), force-deletes the dying worker pod, and auto-resumes onto the replacement `ComputeClass` node with zero item or save loss.
+4. **Direct `hostPort` Ingress & Link-Local/DNS Filtering:** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`<CLUSTER_NAME>-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to [`manifests/actors.yaml`](manifests/actors.yaml) or `WORLDS_LIST` in `.env` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits. Because Linux ephemeral client ports (`32768–60999`) overlap `34197+`, `factorio-gateway` drops link-local (`169.254.0.0/16`, `fe80::/10`), bogon/multicast, and DNS source port `53` packets before waking Actors so node-local GCE metadata DNS replies (`169.254.169.254:53`) never trigger phantom wakes.
+5. **Gateway Ingress Cold Wake & Automatic Scale-to-Zero:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. When all worlds remain suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0` so GKE NAP reclaims worker nodes to zero.
+6. **Cost-Optimized Control Pool, Multi-Zone Cascade, & Quiet Observability:**
    ```bash
-   make optimize-cluster   # Runs ./hack/setup-cost-optimized-pools.sh
+   make optimize-cluster      # Runs ./hack/setup-cost-optimized-pools.sh (and applies quiet observability)
+   make observability-status  # Check GKE logging, Managed Prometheus, and ate-api-server log level
+   make observability-on      # Re-enable WORKLOAD logs, ate-api-server=info, & Managed Prometheus for debugging
+   make observability-off     # Restore quiet idle defaults (SYSTEM-only logs/metrics, Prometheus off, ateapi=error)
    ```
+   By default (`.env.example`), `install-substrate` sets `ATE_API_LOG_LEVEL=error` via `ate-setup` and `optimize-cluster` applies `GKE_LOGGING=SYSTEM`, `GKE_MONITORING=SYSTEM`, and `GKE_MANAGED_PROMETHEUS=false` via GKE cluster flags (`kubectl logs` still works live; pass `ATE_API_LOG_LEVEL=debug make observability-on` when debugging Substrate).
 
 ### Automatic Zero-Touch Factorio Version Upgrades (Proactive + Reactive)
 Because Steam auto-updates players' Factorio clients whenever Wube releases a new `stable` patch, `factorio-gateway` implements a **dual auto-upgrade system**:
@@ -79,11 +86,22 @@ Because Steam auto-updates players' Factorio clients whenever Wube releases a ne
 - [`cmd/factorio-probe/main.go`](cmd/factorio-probe/main.go) — CLI probe that sends real Factorio 2.x UDP `ConnectionRequest` packets (`0x42 0x02 0x01 0x18...`) to test wake-on-UDP and measure resume latency without needing a graphical Factorio client.
 - [`internal/tunnelproto/frame.go`](internal/tunnelproto/frame.go) — Wire framing (`[2B addrLen][addr][payload]`), Factorio UDP header validation, and client/server version extraction.
 - [`internal/rcon/rcon.go`](internal/rcon/rcon.go) — Minimal Source RCON TCP client for talking to Factorio on `127.0.0.1:27015`.
-- [`manifests/`](manifests/) — Kubernetes (`Namespace`, `WorkerPool`, `Deployment`, `Service`) and Agent Substrate (`ActorTemplate`) manifest templates.
-- [`hack/deploy.sh`](hack/deploy.sh) — Builds images with `ko`, applies manifests, dynamically resolves the latest `factoriotools/factorio:stable` digest, registers `factorio-server`, and creates `world-vanilla` and `world-deathworld`.
-- [`hack/test-e2e.sh`](hack/test-e2e.sh) — Automated end-to-end verification script testing wake-on-UDP, RCON status, multi-world multiplexing on the single worker pod, and idle auto-suspend.
-- [`hack/prove-e2e.sh`](hack/prove-e2e.sh) — Full stateful proof that spawns a `steel-chest` with `42` `automation-science-pack`s at `(0.5, 0.5)` on `nauvis` via RCON Lua, multiplexes to `world-deathworld` (evicting `world-vanilla` to GCS), wakes `world-vanilla` back up from GCS, and verifies the chest and all 42 science packs survived.
-- [`hack/watch-actors.sh`](hack/watch-actors.sh) — Live terminal dashboard (`make watch`) and transition logger (`make watch-transitions`) showing Actor states, WorkerPool pod assignments, GCS snapshot URIs, and gateway UDP counters.
+- [`manifests/`](manifests/) — Decomposed, standalone YAML manifests:
+  - [`namespace.yaml`](manifests/namespace.yaml) — `factorio` Namespace (`ate.dev/api-access: "true"`).
+  - [`rbac.yaml`](manifests/rbac.yaml) — `factorio-gateway` ServiceAccount, WorkerPool scaler Role, and Node preemption watcher ClusterRole.
+  - [`computeclass.yaml`](manifests/computeclass.yaml) — Multi-zone Spot-first GKE `ComputeClass` (`factorio-substrate-worker`).
+  - [`postgres-compact.yaml`](manifests/postgres-compact.yaml) — Compact 10Gi / 5m-CPU `ate-system/postgres` StatefulSet for `e2-medium` control pools.
+  - [`workerpool.yaml`](manifests/workerpool.yaml) — Scale-to-zero `WorkerPool/factorio`.
+  - [`gateway.yaml`](manifests/gateway.yaml) — Always-on `factorio-gateway` Deployment (`hostPort` UDP) + `factorio-gateway-http` Service.
+  - [`actor-template.yaml`](manifests/actor-template.yaml) — `factorio/factorio-server` `ActorTemplate` (`sidecar` + `factoriotools/factorio`).
+  - [`actors.yaml`](manifests/actors.yaml) — Declarative list of Factorio world Actors (`world-vanilla`, `world-deathworld`, `world-railworld`, `world-ribbonworld`).
+- [`.env.example`](.env.example) — Sample environment template (`PROJECT_ID`, GKE version, Artifact Registry, Substrate image source, and gateway tuning). Copy to `.env` (gitignored).
+- [`Makefile`](Makefile) — Granular targets (`make help`) covering cluster creation, GCP setup, Substrate install, pool cost optimization, individual manifest apply steps, E2E verification, and teardown.
+- [`hack/`](hack/) — Modular lifecycle scripts:
+  - `create-cluster.sh`, `gcp-resources.sh`, `install-substrate.sh`, `setup-cost-optimized-pools.sh`, `observability.sh` — Infrastructure, Substrate installation, & observability toggles.
+  - `deploy-k8s.sh`, `deploy-actors.sh`, `deploy.sh` — Granular manifest application (`namespace`, `computeclass`, `workerpool`, `gateway`, `actor-template`, `actors`).
+  - `teardown.sh`, `delete-cluster.sh` — Workload, GCP, and GKE cluster cleanup (`make teardown`, `make destroy`).
+  - `test-e2e.sh`, `prove-e2e.sh`, `test-spot-cascade-preemption.sh`, `watch-actors.sh` — Automated verification, Spot preemption cascade testing, and live monitoring.
 - [`TRADEOFFS.md`](TRADEOFFS.md) — Explicit record of all architectural trade-offs and design decisions.
 
 ---
@@ -91,43 +109,49 @@ Because Steam auto-updates players' Factorio clients whenever Wube releases a ne
 ## Reproducible Step-by-Step Instructions
 
 ### Prerequisites
-- `gcloud`, `kubectl`, `ko`, `go` (1.24+), `jq`, `curl`
-- A local checkout of the Agent Substrate repository (sibling directory `../substrate` or set `SUBSTRATE_REPO=/path/to/substrate`)
+- `gcloud`, `kubectl`, `ko`, `go` (1.27+), `jq`, `curl`, `envsubst`, `python3` (with `PyYAML`)
 
 ### 1. Configure Environment
-Copy `.ate-dev-env.sh.example` to `.ate-dev-env.sh` and set your GCP project and cluster details (defaults are pre-configured for `drewbr-sandbox-85` / `factorio-ate`):
+Copy `.env.example` to `.env` (gitignored) and set `PROJECT_ID` (and any cluster/region overrides):
 
 ```bash
-cp .ate-dev-env.sh.example .ate-dev-env.sh
-source .ate-dev-env.sh
+cp .env.example .env
 ```
 
-### 2. Provision the GKE Cluster & Install Agent Substrate
-From your Agent Substrate checkout (`$SUBSTRATE_REPO`), bootstrap the GKE cluster (`c3-standard-4` nodes for nested virtualization / gVisor support) and GCS snapshot bucket, then deploy `ate-system`:
+By default, `.env.example` targets GKE `1.37`, Artifact Registry (`AR_REPO=factorio-ate`), and published Agent Substrate `v1.0.0` images (`ghcr.io/agent-substrate/substrate`). To build Agent Substrate from a local checkout instead, set `SUBSTRATE_REPO=/path/to/substrate` and leave `SUBSTRATE_IMAGE_REPO` empty.
+
+### 2. Provision & Deploy Step-by-Step (or Single-Command `make up`)
+Run `make help` to inspect all targets. You can execute every lifecycle stage individually:
 
 ```bash
-cd "$SUBSTRATE_REPO"
-# Build and deploy Agent Substrate 1.0 control plane + atelet DaemonSet
-source "$(pwd)/../factorio-substrate/.ate-dev-env.sh"
-go run ./cmd/ate-setup deploy ate-system --no-dev-env --sandbox-classes=gvisor
+# 1. Create the GKE cluster with Workload Identity & Spot bootstrap node pool
+make cluster
+
+# 2. Provision GCS snapshot bucket, Artifact Registry repo, IAM bindings, & UDP firewall rule
+make gcp
+
+# 3. Install Agent Substrate control plane (ate-system) & build bin/kubectl-ate
+make install-substrate
+
+# 4. Migrate to 1x e2-medium Spot control-pool, compact Postgres (10Gi), & multi-zone ComputeClass
+make optimize-cluster
+
+# 5. Deploy Factorio manifests step by step (or run `make deploy` for all six)
+make namespace
+make computeclass
+make workerpool
+make gateway
+make actor-template
+make actors
 ```
 
-### 3. Deploy Factorio Gateway, Sidecar, WorkerPool, and Worlds
-Return to `factorio-substrate` and run `make deploy` (or `./hack/deploy.sh`):
+Or run the entire sequence from a blank GCP project in one command:
 
 ```bash
-cd /path/to/factorio-substrate
-make deploy
+make up
 ```
 
-This will:
-1. Build and push `factorio-sidecar` and `factorio-gateway` to `$KO_DOCKER_REPO`.
-2. Create the `factorio` `ATEnamespace` and 1-replica `factorio-pool` `WorkerPool`.
-3. Deploy `factorio-gateway` and expose it via the `factorio-gateway-udp` `LoadBalancer` Service (UDP ports `34197` and `34198`).
-4. Register the `factorio-server` `ActorTemplate` (`SNAPSHOT_CONTENT_SCOPE_FULL` + `/factorio` `durableDir`).
-5. Create `factorio/world-vanilla` and `factorio/world-deathworld` and suspend both into GCS so they start in `ACTOR_STATE_SUSPENDED` (zero idle compute used by Factorio).
-
-### 4. Verify & Prove End-to-End (Headless Probe, Live Watch, & Stateful World Persistence)
+### 3. Verify & Prove End-to-End (Headless Probe, Live Watch, & Stateful World Persistence)
 You can watch Actor state transitions live in one terminal while running the end-to-end stateful proof in another:
 
 ```bash
@@ -141,6 +165,9 @@ make prove
 
 # Trigger an immediate Docker Hub check & ActorTemplate upgrade check on factorio-gateway:
 make check-update
+
+# Simulate a 2-hop GCE Spot preemption cascade (cold ComputeClass replacement + warm standby):
+make test-preemption
 ```
 
 To also verify the automatic idle-timeout RCON save + suspend cycle using a shortened 30-second timeout (and automatically restore the 10-minute timeout afterward):
@@ -149,7 +176,7 @@ To also verify the automatic idle-timeout RCON save + suspend cycle using a shor
 make verify-with-idle
 ```
 
-### 5. Connect with a Real Factorio Client
+### 4. Connect with a Real Factorio Client
 Find the gateway node's external IP (`hostPort`):
 
 ```bash
@@ -165,7 +192,19 @@ In the Factorio 2.1.x game client (**Multiplayer -> Connect to address**):
 
 To reset all 4 worlds so they generate brand-new custom maps on next connect:
 ```bash
-RESET_WORLDS=true ./hack/deploy.sh
+RESET_WORLDS=true make actors
 ```
 
 *(Note: If the world is currently suspended, the first connection attempt triggers `ResumeActor` in the background; if a cold restore or version migration takes longer than the client's retry window, simply click **Connect** a second time once the world is awake.)*
+
+### 5. Tear Down Resources
+```bash
+# Delete Factorio Actors, ActorTemplate, namespace, RBAC, ComputeClass, and snapshots:
+make teardown
+
+# Also delete GCS bucket, Artifact Registry repo, UDP firewall rule, & transfer GSA:
+make teardown ALL=1
+
+# Delete everything including the GKE cluster & PersistentVolumes:
+make destroy
+```

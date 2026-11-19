@@ -17,26 +17,15 @@
 # Modes:
 #   ./hack/watch-actors.sh                  # Full live-updating terminal dashboard
 #   ./hack/watch-actors.sh --transitions    # Timestamped log of every Actor state change
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+load_env
+ensure_kubectl_ate
 
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
-
-if [[ -f .ate-dev-env.sh ]]; then
-  source .ate-dev-env.sh
-fi
-
-SUBSTRATE_REPO="${SUBSTRATE_REPO:-$(cd "${ROOT}/../substrate" && pwd)}"
 INTERVAL="${WATCH_INTERVAL:-1}"
 MODE="${1:-dashboard}"
 
-KUBECTL_ATE_BIN="$(mktemp /tmp/kubectl-ate.XXXXXX)"
-trap 'rm -f "${KUBECTL_ATE_BIN}"' EXIT
-(cd "${SUBSTRATE_REPO}" && go build -o "${KUBECTL_ATE_BIN}" ./cmd/kubectl-ate)
-
 if [[ "${MODE}" == "--transitions" ]]; then
-  echo "[$(date +%H:%M:%S)] Watching Factorio Actors in atespace 'factorio' for state transitions..."
+  echo "[$(date +%H:%M:%S)] Watching Factorio Actors in atespace '${ATESPACE}' for state transitions..."
   declare -A prev_line
   while true; do
     while IFS=$'\t' read -r name state pod ver; do
@@ -50,7 +39,7 @@ if [[ "${MODE}" == "--transitions" ]]; then
         fi
         prev_line["${name}"]="${summary}"
       fi
-    done < <("${KUBECTL_ATE_BIN}" get actors -a factorio -o json 2>/dev/null | jq -r '.actors[]? | [.metadata.name, .status.state, ((.status.workerAssignment.workerNamespace // "") + "/" + (.status.workerAssignment.workerPod // "") | if . == "/" then "<none>" else . end), .metadata.version] | @tsv')
+    done < <(run_kubectl_ate get actors -a "${ATESPACE}" -o json 2>/dev/null | jq -r '.actors[]? | [.metadata.name, .status.state, ((.status.workerAssignment.workerNamespace // "") + "/" + (.status.workerAssignment.workerPod // "") | if . == "/" then "<none>" else . end), .metadata.version] | @tsv')
     sleep "${INTERVAL}"
   done
 else
@@ -62,13 +51,13 @@ else
     echo ""
     echo "--- GKE Nodes & WorkerPool (Scale-to-Zero) ---"
     kubectl get nodes -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[-1].type,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool,SPOT:.metadata.labels.cloud\.google\.com/gke-spot,MACHINE:.metadata.labels.node\.kubernetes\.io/instance-type,EXTERNAL-IP:.status.addresses[?(@.type=="ExternalIP")].address' 2>/dev/null || true
-    kubectl get workerpool -n factorio factorio -o custom-columns='NAME:.metadata.name,SPEC_REPLICAS:.spec.replicas,READY_REPLICAS:.status.readyReplicas' 2>/dev/null || true
+    kubectl get workerpool -n "${NAMESPACE}" factorio -o custom-columns='NAME:.metadata.name,SPEC_REPLICAS:.spec.replicas,READY_REPLICAS:.status.readyReplicas' 2>/dev/null || true
     echo ""
-    echo "--- Substrate Actors (kubectl-ate get actors -a factorio) ---"
-    "${KUBECTL_ATE_BIN}" get actors -a factorio || true
+    echo "--- Substrate Actors (kubectl-ate get actors -a ${ATESPACE}) ---"
+    run_kubectl_ate get actors -a "${ATESPACE}" || true
     echo ""
     echo "--- UDP Gateway Status (:8080/status) ---"
-    kubectl get --raw /api/v1/namespaces/factorio/services/factorio-gateway-http:status-http/proxy/status 2>/dev/null | jq . || true
+    kubectl get --raw "/api/v1/namespaces/${NAMESPACE}/services/factorio-gateway-http:status-http/proxy/status" 2>/dev/null | jq . || true
     sleep "${INTERVAL}"
   done
 fi

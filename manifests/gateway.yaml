@@ -12,76 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: factorio
-  labels:
-    ate.dev/api-access: "true"
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: factorio-gateway
-  namespace: factorio
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: factorio-gateway-workerpool-scaler
-  namespace: factorio
-rules:
-- apiGroups: ["ate.dev"]
-  resources: ["workerpools"]
-  verbs: ["get", "patch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: factorio-gateway-workerpool-scaler
-  namespace: factorio
-subjects:
-- kind: ServiceAccount
-  name: factorio-gateway
-  namespace: factorio
-roleRef:
-  kind: Role
-  name: factorio-gateway-workerpool-scaler
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: ate.dev/v1
-kind: WorkerPool
-metadata:
-  name: factorio
-  namespace: factorio
-  labels:
-    workload: factorio
-  annotations:
-    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
-spec:
-  # Single physical worker pod that multiplexes all 4 Factorio worlds
-  # (world-vanilla, world-deathworld, world-railworld, world-ribbonworld) on demand.
-  # Automatically scaled 0 -> 1 on inbound UDP traffic and 1 -> 0 after idle timeout.
-  replicas: ${MAX_ACTIVE_WORLDS}
-  workerImage: ${WORKER_IMAGE}
-  sandboxClasses:
-  - name: gvisor
-  template:
-    nodeSelector:
-      cloud.google.com/gke-nodepool: substrate-worker-pool
-    tolerations:
-    - key: "ate.dev/sandboxClass"
-      operator: "Equal"
-      value: "gvisor"
-      effect: "NoSchedule"
-    resources:
-      limits:
-        cpu: "2"
-        memory: 4Gi
-      requests:
-        cpu: 500m
-        memory: 4Gi
----
+# Always-on Factorio UDP gateway Deployment + internal HTTP status Service.
+# Built and applied via `make gateway` (which resolves `ko://` and updates
+# `ports` dynamically if WORLDS_LIST or BASE_UDP_PORT differs from the 4
+# default worlds shown below).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -102,7 +36,7 @@ spec:
         app: factorio-gateway
     spec:
       nodeSelector:
-        cloud.google.com/gke-nodepool: control-pool
+        cloud.google.com/gke-nodepool: ${CONTROL_POOL_NAME}
       serviceAccountName: factorio-gateway
       containers:
       - name: gateway
@@ -130,7 +64,22 @@ spec:
         - "--upstream-repo=factoriotools/factorio"
         - "--upstream-tag=stable"
         ports:
-${GATEWAY_UDP_PORTS}
+        - name: udp-port-34197
+          containerPort: 34197
+          hostPort: 34197
+          protocol: UDP
+        - name: udp-port-34198
+          containerPort: 34198
+          hostPort: 34198
+          protocol: UDP
+        - name: udp-port-34199
+          containerPort: 34199
+          hostPort: 34199
+          protocol: UDP
+        - name: udp-port-34200
+          containerPort: 34200
+          hostPort: 34200
+          protocol: UDP
         - name: http-status
           containerPort: 8080
           protocol: TCP

@@ -13,353 +13,246 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
-
-if [[ -f .ate-dev-env.sh ]]; then
-  source .ate-dev-env.sh
-fi
-
-PROJECT_ID="${PROJECT_ID:-drewbr-sandbox-85}"
-CLUSTER_NAME="${CLUSTER_NAME:-factorio-ate}"
-CLUSTER_LOCATION="${CLUSTER_LOCATION:-us-central1-a}"
+# Migrates the GKE cluster to a cost-optimized Option A scale-to-zero topology:
+#   1. Single-node Spot `control-pool` (e2-medium) in CLUSTER_LOCATION.
+#   2. Compact 10Gi / 5m-CPU `ate-system/postgres` StatefulSet (preserving roles + data).
+#   3. Deletes the initial `e2-standard-4` bootstrap pool (`default-pool`).
+#   4. Enables multi-zone worker scheduling (`WORKER_ZONES`) and applies `manifests/computeclass.yaml`.
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+load_env
 
 echo "================================================================================"
-echo " Setting up Cost-Optimized Node Pools (Option A Scale-to-Zero)"
-echo " Cluster:  ${CLUSTER_NAME} (${CLUSTER_LOCATION}) in project ${PROJECT_ID}"
+echo " Cost-Optimized Node Pools & Multi-Zone Spot ComputeClass"
+echo " Cluster: ${CLUSTER_NAME} (${CLUSTER_LOCATION}) in ${PROJECT_ID}"
 echo "================================================================================"
 
-if ! kubectl get ds -n ate-system atelet >/dev/null 2>&1; then
-  echo "error: could not find atelet DaemonSet in namespace ate-system" >&2
-  exit 1
-fi
+kubectl get ds -n ate-system atelet >/dev/null 2>&1 \
+  || die "atelet DaemonSet not found in ate-system — run 'make install-substrate' first"
 
-# 1. Back up postgres data before touching storage.
-echo "==> Backing up postgres database 'atepg'..."
-mkdir -p /tmp/factorio-substrate-backup
-kubectl exec -n ate-system postgres-0 -c postgres -- pg_dump -U postgres atepg > /tmp/factorio-substrate-backup/atepg.sql
-if [[ ! -s /tmp/factorio-substrate-backup/atepg.sql ]]; then
-  echo "error: postgres backup is empty" >&2
-  exit 1
-fi
-echo "    Postgres backup saved ($(wc -l < /tmp/factorio-substrate-backup/atepg.sql) lines)"
-
-# 2. Update cluster autoscaling profile to optimize-utilization for rapid scale-down.
-echo "==> Updating cluster autoscaling profile to 'optimize-utilization'..."
-gcloud container clusters update "${CLUSTER_NAME}" \
-  --zone "${CLUSTER_LOCATION}" \
-  --project "${PROJECT_ID}" \
-  --autoscaling-profile=optimize-utilization
-
-# 3. Ensure 'substrate-worker-pool' is Spot (0 -> 1 n2-standard-2 Ice Lake, tainted, scale-to-zero).
-if gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  WORKER_IS_SPOT="$(gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(config.spot)' 2>/dev/null || echo "")"
-  if [[ "${WORKER_IS_SPOT}" != "True" ]]; then
-    echo "==> Existing 'substrate-worker-pool' is not Spot. Deleting to recreate as Spot..."
-    gcloud container node-pools delete substrate-worker-pool \
-      --cluster "${CLUSTER_NAME}" \
-      --zone "${CLUSTER_LOCATION}" \
-      --project "${PROJECT_ID}" \
-      --quiet
-  else
-    echo "==> 'substrate-worker-pool' already exists and is Spot"
-  fi
-fi
-
-if ! gcloud container node-pools describe substrate-worker-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  MAX_WORKER_NODES="${MAX_WORKER_NODES:-1}"
-  echo "==> Creating Spot 'substrate-worker-pool' (0 -> ${MAX_WORKER_NODES} n2-standard-2 Ice Lake, scale-to-zero)..."
-  gcloud container node-pools create substrate-worker-pool \
-    --cluster "${CLUSTER_NAME}" \
+step "Setting cluster autoscaling profile to optimize-utilization"
+cur_autoscaling_profile="$(gcloud container clusters describe "${CLUSTER_NAME}" \
+  --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" \
+  --format='value(autoscaling.autoscalingProfile)' 2>/dev/null || true)"
+if [[ "${cur_autoscaling_profile}" != "OPTIMIZE_UTILIZATION" ]]; then
+  gcloud container clusters update "${CLUSTER_NAME}" \
     --zone "${CLUSTER_LOCATION}" \
     --project "${PROJECT_ID}" \
-    --spot \
-    --machine-type=n2-standard-2 \
-    --min-cpu-platform="Intel Ice Lake" \
-    --disk-size=50GB \
-    --disk-type=pd-balanced \
-    --enable-autoscaling \
-    --min-nodes=0 \
-    --max-nodes="${MAX_WORKER_NODES}" \
-    --node-taints="ate.dev/sandboxClass=gvisor:NoSchedule"
+    --autoscaling-profile=optimize-utilization \
+    --quiet >/dev/null
+  ok "Autoscaling profile set"
+else
+  ok "Autoscaling profile already OPTIMIZE_UTILIZATION"
 fi
 
-# 4. Ensure 'control-pool' is Spot (1x e2-medium, 30GB pd-standard).
-if gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  CONTROL_IS_SPOT="$(gcloud container node-pools describe control-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(config.spot)' 2>/dev/null || echo "")"
-  if [[ "${CONTROL_IS_SPOT}" != "True" ]]; then
-    echo "==> Existing 'control-pool' is not Spot. Migrating control plane to Spot..."
-    echo "    Deleting non-Spot 'control-pool'..."
-    gcloud container node-pools delete control-pool \
-      --cluster "${CLUSTER_NAME}" \
-      --zone "${CLUSTER_LOCATION}" \
-      --project "${PROJECT_ID}" \
-      --quiet
+release_channel="$(gcloud container clusters describe "${CLUSTER_NAME}" \
+  --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" \
+  --format='value(releaseChannel.channel)' 2>/dev/null || true)"
 
-    echo "    Recreating Spot 'control-pool' (1x e2-medium)..."
-    gcloud container node-pools create control-pool \
-      --cluster "${CLUSTER_NAME}" \
-      --zone "${CLUSTER_LOCATION}" \
-      --project "${PROJECT_ID}" \
-      --spot \
-      --machine-type=e2-medium \
-      --disk-size=30GB \
-      --disk-type=pd-standard \
-      --num-nodes=1 \
-      --tags=factorio-gateway-node \
-      --no-enable-autoupgrade
+create_control_pool() {
+  local args=(
+    --cluster="${CLUSTER_NAME}"
+    --zone="${CLUSTER_LOCATION}"
+    --project="${PROJECT_ID}"
+    --spot
+    --machine-type="${CONTROL_POOL_MACHINE_TYPE}"
+    --disk-size=30GB
+    --disk-type=pd-standard
+    --num-nodes=1
+    --node-locations="${CLUSTER_LOCATION}"
+    --tags="${CLUSTER_NODE_TAGS}"
+  )
+  if [[ -z "${release_channel}" ]]; then
+    args+=(--no-enable-autoupgrade)
+  fi
+  gcloud container node-pools create "${CONTROL_POOL_NAME}" "${args[@]}" --quiet
+}
 
-    echo "    Waiting for postgres-0 and ate-api-server to be Ready on Spot control-pool..."
-    kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=300s
-    kubectl rollout status deployment/ate-api-server -n ate-system --timeout=180s
+step "Ensuring Spot ${CONTROL_POOL_NAME} (1x ${CONTROL_POOL_MACHINE_TYPE} in ${CLUSTER_LOCATION})"
+if gcloud container node-pools describe "${CONTROL_POOL_NAME}" \
+    --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  control_is_spot="$(gcloud container node-pools describe "${CONTROL_POOL_NAME}" \
+    --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" \
+    --format='value(config.spot)' 2>/dev/null || true)"
+  if [[ "${control_is_spot}" != "True" ]]; then
+    warn "Existing '${CONTROL_POOL_NAME}' is not Spot; recreating as Spot"
+    gcloud container node-pools delete "${CONTROL_POOL_NAME}" \
+      --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --quiet
+    create_control_pool
   else
-    echo "==> 'control-pool' already exists and is Spot"
+    gcloud container node-pools update "${CONTROL_POOL_NAME}" \
+      --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" \
+      --node-locations="${CLUSTER_LOCATION}" --quiet >/dev/null || true
+    ok "Spot ${CONTROL_POOL_NAME} already exists"
   fi
 else
-  echo "==> Creating Spot 'control-pool' (1x e2-medium, 30GB pd-standard)..."
-  gcloud container node-pools create control-pool \
-    --cluster "${CLUSTER_NAME}" \
-    --zone "${CLUSTER_LOCATION}" \
-    --project "${PROJECT_ID}" \
-    --spot \
-    --machine-type=e2-medium \
-    --disk-size=30GB \
-    --disk-type=pd-standard \
-    --num-nodes=1 \
-    --tags=factorio-gateway-node \
-    --no-enable-autoupgrade
-
-  echo "    Waiting for postgres-0 and ate-api-server to be Ready on Spot control-pool..."
-  kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=300s
-  kubectl rollout status deployment/ate-api-server -n ate-system --timeout=180s
+  create_control_pool
+  ok "Created Spot ${CONTROL_POOL_NAME}"
 fi
+kubectl wait --for=condition=Ready node -l "cloud.google.com/gke-nodepool=${CONTROL_POOL_NAME}" --timeout=180s >/dev/null
 
-# Ensure GCP Firewall Rule allows UDP hostPorts (34197-34297).
-echo "==> Ensuring GCP Firewall Rule allows UDP hostPorts (34197-34297)..."
-if ! gcloud compute firewall-rules describe factorio-ate-allow-udp-hostport --project="${PROJECT_ID}" >/dev/null 2>&1; then
-  echo "    Creating firewall rule factorio-ate-allow-udp-hostport..."
-  gcloud compute firewall-rules create factorio-ate-allow-udp-hostport \
-    --project="${PROJECT_ID}" \
-    --network=default \
-    --allow=udp:34197-34297 \
-    --source-ranges=0.0.0.0/0 \
-    --description="Allow Factorio UDP traffic to node hostPorts 34197-34297"
-else
-  echo "    Firewall rule factorio-ate-allow-udp-hostport already exists"
-fi
+# Cordon initial bootstrap pools so migrated workloads schedule directly onto CONTROL_POOL_NAME.
+for legacy_pool in default-pool substrate-node-pool; do
+  if gcloud container node-pools describe "${legacy_pool}" \
+      --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    for node in $(kubectl get nodes -l "cloud.google.com/gke-nodepool=${legacy_pool}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+      kubectl cordon "${node}" >/dev/null || true
+    done
+  fi
+done
 
-# Remove legacy LoadBalancer Service if present.
-if kubectl get svc -n factorio factorio-gateway >/dev/null 2>&1; then
-  echo "==> Removing legacy LoadBalancer Service if present (using hostPort ingress)..."
-  kubectl delete svc -n factorio factorio-gateway --ignore-not-found
-fi
-
-# Cordon old 'substrate-node-pool' nodes immediately so any recreated workloads land on 'control-pool'.
-if gcloud container node-pools describe substrate-node-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  echo "==> Cordoning old substrate-node-pool nodes to redirect workloads to control-pool..."
-  for node in $(kubectl get nodes -l cloud.google.com/gke-nodepool=substrate-node-pool -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl cordon "${node}" || true
-  done
-fi
-
-# 5. Annotate atelet DaemonSet so Cluster Autoscaler can evict it during scale-to-zero,
-#    right-size CPU requests on atelet and atenet-egress for the e2-medium control-pool,
-#    and set fast snapshot upload/detach delays so scale-to-zero never drops pending local snapshots.
-echo "==> Annotating atelet DaemonSet with safe-to-evict and right-sizing CPU requests..."
+step "Right-sizing ate-system control plane requests for ${CONTROL_POOL_MACHINE_TYPE}"
 kubectl patch ds -n ate-system atelet \
-  -p '{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"true"}}}}}' || true
-kubectl patch ds -n ate-system atelet --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"5m"},{"op":"replace","path":"/spec/template/spec/containers/1/resources/requests/cpu","value":"5m"}]' || true
-if ! kubectl get ds -n ate-system atelet -o jsonpath='{.spec.template.spec.containers[0].args[*]}' | grep -q -- '--snapshot-upload-delay='; then
+  -p '{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"true"}}}}}' >/dev/null || true
+atelet_patch="$(kubectl get ds -n ate-system atelet -o json | jq -c '
+  [
+    (.spec.template.spec.containers // [] | to_entries[] | select(.value.resources.requests != null) |
+      {op: "replace", path: "/spec/template/spec/containers/\(.key)/resources/requests/cpu", value: "5m"},
+      {op: "replace", path: "/spec/template/spec/containers/\(.key)/resources/requests/memory", value: "64Mi"}
+    ),
+    (.spec.template.spec.initContainers // [] | to_entries[] | select(.value.resources.requests != null) |
+      {op: "replace", path: "/spec/template/spec/initContainers/\(.key)/resources/requests/cpu", value: "5m"},
+      {op: "replace", path: "/spec/template/spec/initContainers/\(.key)/resources/requests/memory", value: "64Mi"}
+    )
+  ]')"
+[[ "${atelet_patch}" != "[]" ]] && kubectl patch ds -n ate-system atelet --type=json -p="${atelet_patch}" >/dev/null
+
+if ! kubectl get ds -n ate-system atelet -o jsonpath='{.spec.template.spec.containers[0].args[*]}' 2>/dev/null | grep -q -- '--snapshot-upload-delay='; then
   kubectl patch ds -n ate-system atelet --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-upload-delay=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-detach-delay=30s"}]' || true
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-upload-delay=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--snapshot-detach-delay=30s"}]' >/dev/null || true
 fi
-kubectl patch deployment -n ate-system atenet-egress --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"5m"},{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' || true
+
+if kubectl get deployment -n ate-system atenet-egress >/dev/null 2>&1; then
+  egress_patch="$(kubectl get deployment -n ate-system atenet-egress -o json | jq -c '
+    [
+      (.spec.template.spec.containers // [] | to_entries[] | select(.value.resources.requests != null) |
+        {op: "replace", path: "/spec/template/spec/containers/\(.key)/resources/requests/cpu", value: "5m"},
+        {op: "replace", path: "/spec/template/spec/containers/\(.key)/resources/requests/memory", value: "128Mi"}
+      ),
+      (.spec.template.spec.initContainers // [] | to_entries[] | select(.value.resources.requests != null) |
+        {op: "replace", path: "/spec/template/spec/initContainers/\(.key)/resources/requests/cpu", value: "5m"},
+        {op: "replace", path: "/spec/template/spec/initContainers/\(.key)/resources/requests/memory", value: "128Mi"}
+      )
+    ]')"
+  [[ "${egress_patch}" != "[]" ]] && kubectl patch deployment -n ate-system atenet-egress --type=json -p="${egress_patch}" >/dev/null
+fi
 kubectl patch deployment -n kube-system konnectivity-agent --type=json \
-  -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"ate.dev/sandboxClass","operator":"Exists"}}]' || true
+  -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"ate.dev/sandboxClass","operator":"Exists"}}]' >/dev/null 2>&1 || true
 
-# 6. Scale ate-api-server and ate-idp-server to 1 replica to conserve resources on control-pool.
-echo "==> Scaling ate-api-server and ate-idp-server to 1 replica..."
-kubectl scale deployment/ate-api-server -n ate-system --replicas=1
-kubectl scale deployment/ate-idp-server -n ate-system --replicas=1 || true
+kubectl scale deployment/ate-api-server -n ate-system --replicas=1 >/dev/null
+kubectl scale deployment/ate-idp-server -n ate-system --replicas=1 >/dev/null 2>&1 || true
+ok "Control-plane resource requests tuned"
 
-# 7. Right-size postgres storage from 500Gi to 10Gi and requests to 5m/128Mi.
-CURRENT_STORAGE="$(kubectl get pvc -n ate-system data-postgres-0 -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || echo "")"
-if [[ "${CURRENT_STORAGE}" == "500Gi" ]]; then
-  echo "==> Right-sizing postgres from 500Gi to 10Gi..."
+# Replace 500Gi / 2-CPU Postgres with compact 10Gi / 5m-CPU StatefulSet while preserving roles and data.
+cur_storage="$(kubectl get pvc -n ate-system data-postgres-0 -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || true)"
+cur_cpu="$(kubectl get sts -n ate-system postgres -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null || true)"
+if [[ "${cur_storage}" != "10Gi" || "${cur_cpu}" == "2" ]]; then
+  step "Compacting ate-system/postgres (${cur_storage:-unknown} -> 10Gi, cpu ${cur_cpu:-unknown} -> 5m)"
+  backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/factorio-pg-backup.XXXXXX")"
+  trap 'rm -rf "${backup_dir}"' EXIT
+
+  kubectl scale deployment/ate-api-server -n ate-system --replicas=0 >/dev/null
+  kubectl wait --for=delete pod -l app=ate-api-server -n ate-system --timeout=120s >/dev/null 2>&1 || true
+
+  kubectl exec -n ate-system postgres-0 -c postgres -- pg_dumpall -U postgres --roles-only \
+    | grep -vE '^(CREATE|ALTER) ROLE postgres\b' > "${backup_dir}/roles.sql"
+  kubectl exec -n ate-system postgres-0 -c postgres -- pg_dump -U postgres atepg \
+    > "${backup_dir}/atepg.sql"
+  [[ -s "${backup_dir}/atepg.sql" ]] || die "postgres atepg backup is empty; aborting before storage delete"
+  ok "Backed up roles ($(wc -l < "${backup_dir}/roles.sql") lines) and atepg ($(wc -l < "${backup_dir}/atepg.sql") lines)"
+
   kubectl delete sts -n ate-system postgres --wait=true
   kubectl delete pvc -n ate-system data-postgres-0 --wait=true
+  no_pg_pv() {
+    local pv
+    pv="$(kubectl get pv -o jsonpath='{range .items[?(@.spec.claimRef.name=="data-postgres-0")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    [[ -z "${pv}" ]]
+  }
+  wait_for 180 "postgres PersistentVolume release" no_pg_pv
 
-  cat <<'EOF' | kubectl apply -f -
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-  namespace: ate-system
-  labels:
-    app: postgres
-spec:
-  replicas: 1
-  serviceName: postgres
-  selector:
-    matchLabels:
-      app: postgres
-  template:
-    metadata:
-      labels:
-        app: postgres
-    spec:
-      containers:
-      - name: postgres
-        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
-        args: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
-        env:
-        - name: POSTGRES_DB
-          value: atepg
-        - name: POSTGRES_USER
-          value: postgres
-        - name: POSTGRES_HOST_AUTH_METHOD
-          value: trust
-        - name: PGDATA
-          value: /var/lib/postgresql/data/pgdata
-        lifecycle:
-          postStart:
-            exec:
-              command:
-              - /bin/sh
-              - -ec
-              - |
-                until psql -U postgres -d postgres -Atc 'SELECT 1' >/dev/null 2>&1; do
-                  sleep 1
-                done
-                if ! psql -U postgres -d postgres -Atc \
-                  "SELECT 1 FROM pg_database WHERE datname = 'atepg'" | grep -qx 1; then
-                  createdb -U postgres atepg
-                fi
-        livenessProbe:
-          exec:
-            command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
-          initialDelaySeconds: 10
-          periodSeconds: 10
-        readinessProbe:
-          exec:
-            command: ["/bin/sh", "-ec", "nc -z 127.0.0.1 5432"]
-          initialDelaySeconds: 2
-          periodSeconds: 2
-        resources:
-          requests:
-            cpu: 5m
-            memory: 128Mi
-          limits:
-            cpu: "1"
-            memory: 512Mi
-        volumeMounts:
-        - name: config
-          mountPath: /etc/postgresql
-        - name: servicedns
-          mountPath: /run/servicedns.podcert.ate.dev
-          readOnly: true
-        - name: postgres-ca
-          mountPath: /run/postgres.podcert.ate.dev
-          readOnly: true
-        - name: socket
-          mountPath: /var/run/postgresql
-        - name: data
-          mountPath: /var/lib/postgresql/data
-      initContainers:
-      - name: tls-reloader
-        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
-        env:
-        - name: POSTGRES_USER
-          value: postgres
-        command: ["/bin/sh", "/etc/postgresql/reload-tls.sh"]
-        resources:
-          requests:
-            cpu: 5m
-            memory: 32Mi
-        restartPolicy: Always
-        securityContext:
-          runAsUser: 70
-        volumeMounts:
-        - name: config
-          mountPath: /etc/postgresql
-        - name: servicedns
-          mountPath: /run/servicedns.podcert.ate.dev
-          readOnly: true
-        - name: postgres-ca
-          mountPath: /run/postgres.podcert.ate.dev
-          readOnly: true
-        - name: socket
-          mountPath: /var/run/postgresql
-      securityContext:
-        fsGroup: 70
-        fsGroupChangePolicy: OnRootMismatch
-      volumes:
-      - name: config
-        configMap:
-          name: postgres-config
-      - name: servicedns
-        projected:
-          defaultMode: 0600
-          sources:
-          - podCertificate:
-              signerName: servicedns.podcert.ate.dev/identity
-              keyType: ECDSAP256
-              credentialBundlePath: credential-bundle.pem
-      - name: socket
-        emptyDir: {}
-      - name: postgres-ca
-        projected:
-          sources:
-          - clusterTrustBundle:
-              signerName: postgres.podcert.ate.dev/identity
-              labelSelector:
-                matchLabels:
-                  podcert.ate.dev/canarying: live
-              path: trust-bundle.pem
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 10Gi
-EOF
+  kubectl apply -f "${REPO_ROOT}/manifests/postgres-compact.yaml"
+  kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=300s
+  atepg_ready() {
+    kubectl exec -n ate-system postgres-0 -c postgres -- psql -U postgres -d atepg -Atc 'SELECT 1' >/dev/null 2>&1
+  }
+  wait_for 60 "postgres atepg database initialization" atepg_ready
 
-  echo "==> Waiting for postgres-0 to be Ready on new 10Gi volume..."
-  kubectl wait --for=condition=ready pod/postgres-0 -n ate-system --timeout=180s
+  if [[ -s "${backup_dir}/roles.sql" ]]; then
+    kubectl exec -i -n ate-system postgres-0 -c postgres -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres < "${backup_dir}/roles.sql" >/dev/null
+  fi
+  kubectl exec -i -n ate-system postgres-0 -c postgres -- psql -v ON_ERROR_STOP=1 -U postgres -d atepg < "${backup_dir}/atepg.sql" >/dev/null
 
-  echo "==> Restoring 'atepg' database data..."
-  kubectl exec -i -n ate-system postgres-0 -c postgres -- psql -U postgres -d atepg < /tmp/factorio-substrate-backup/atepg.sql
-  echo "    Database restored successfully."
+  kubectl scale deployment/ate-api-server -n ate-system --replicas=1 >/dev/null
+  kubectl rollout status deployment/ate-api-server -n ate-system --timeout=180s
+  ok "Compact postgres-0 restored and ate-api-server Ready"
+else
+  kubectl apply -f "${REPO_ROOT}/manifests/postgres-compact.yaml" >/dev/null
+  ok "ate-system/postgres already compact (${cur_storage}, cpu=${cur_cpu})"
 fi
 
-# 8. If old 'substrate-node-pool' exists, cordon/drain and delete it.
-if gcloud container node-pools describe substrate-node-pool --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
-  echo "==> Cordoning old substrate-node-pool nodes..."
-  for node in $(kubectl get nodes -l cloud.google.com/gke-nodepool=substrate-node-pool -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl cordon "${node}" || true
-  done
+# Delete initial / legacy pools BEFORE adding multi-zone cluster locations so bootstrap VMs never replicate across zones.
+for legacy_pool in default-pool substrate-node-pool substrate-worker-pool; do
+  if gcloud container node-pools describe "${legacy_pool}" \
+      --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    step "Draining and deleting bootstrap/legacy pool '${legacy_pool}'"
+    for node in $(kubectl get nodes -l "cloud.google.com/gke-nodepool=${legacy_pool}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+      kubectl cordon "${node}" >/dev/null 2>&1 || true
+      kubectl drain "${node}" --delete-emptydir-data --ignore-daemonsets --force --timeout=180s >/dev/null 2>&1 || true
+    done
+    gcloud container node-pools delete "${legacy_pool}" \
+      --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --quiet
+    ok "Deleted pool '${legacy_pool}'"
+  fi
+done
 
-  echo "==> Draining old substrate-node-pool nodes to move workloads to control-pool..."
-  for node in $(kubectl get nodes -l cloud.google.com/gke-nodepool=substrate-node-pool -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl drain "${node}" --delete-emptydir-data --ignore-daemonsets --force --timeout=180s || true
-  done
+_sort_zones() {
+  printf '%s\n' "$1" | tr ';,' '\n' | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd, -
+}
 
-  echo "==> Deleting old substrate-node-pool (2x c3-standard-4)..."
-  gcloud container node-pools delete substrate-node-pool \
+step "Enabling multi-zone worker locations (${WORKER_ZONES}) on cluster ${CLUSTER_NAME}"
+cur_cluster_locs="$(_sort_zones "$(gcloud container clusters describe "${CLUSTER_NAME}" \
+  --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" --format='value(locations)' 2>/dev/null || true)")"
+want_worker_zones="$(_sort_zones "${WORKER_ZONES}")"
+if [[ "${cur_cluster_locs}" != "${want_worker_zones}" ]]; then
+  gcloud container clusters update "${CLUSTER_NAME}" \
+    --zone "${CLUSTER_LOCATION}" \
+    --project "${PROJECT_ID}" \
+    --node-locations="${WORKER_ZONES}" \
+    --quiet >/dev/null
+  ok "Cluster locations set to ${WORKER_ZONES}"
+else
+  ok "Cluster locations already ${cur_cluster_locs}"
+fi
+
+step "Pinning ${CONTROL_POOL_NAME} to single zone (${CLUSTER_LOCATION})"
+cur_pool_locs="$(_sort_zones "$(gcloud container node-pools describe "${CONTROL_POOL_NAME}" \
+  --cluster "${CLUSTER_NAME}" --zone "${CLUSTER_LOCATION}" --project "${PROJECT_ID}" \
+  --format='value(locations)' 2>/dev/null || true)")"
+want_pool_locs="$(_sort_zones "${CLUSTER_LOCATION}")"
+if [[ "${cur_pool_locs}" != "${want_pool_locs}" ]]; then
+  gcloud container node-pools update "${CONTROL_POOL_NAME}" \
     --cluster "${CLUSTER_NAME}" \
     --zone "${CLUSTER_LOCATION}" \
     --project "${PROJECT_ID}" \
-    --quiet
+    --node-locations="${CLUSTER_LOCATION}" \
+    --quiet >/dev/null
+  ok "${CONTROL_POOL_NAME} pinned to ${CLUSTER_LOCATION}"
+else
+  ok "${CONTROL_POOL_NAME} already pinned to ${cur_pool_locs}"
 fi
 
+step "Applying ComputeClass from manifests/computeclass.yaml"
+render_computeclass_yaml | kubectl apply -f -
+
+ensure_udp_firewall_rule
+
+"${REPO_ROOT}/hack/observability.sh" apply
+
+step "Waiting for ate-system workloads after node pool migration"
+kubectl -n ate-system wait --for=condition=Available deploy --all --timeout=5m
+kubectl -n ate-system rollout status sts/postgres --timeout=5m
+kubectl -n ate-system rollout status ds/atelet --timeout=5m
+
 echo "================================================================================"
-echo " Cost-optimized node pool migration complete!"
-echo " Nodes:"
+echo " Cost-optimized pool migration complete"
 kubectl get nodes -o wide
 echo "================================================================================"

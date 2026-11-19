@@ -147,4 +147,22 @@ Using **Agent Substrate**, we turn Factorio worlds into stateful **Substrate Act
   - We create a single GCP VPC Firewall rule (`factorio-ate-allow-udp-hostport`) allowing port range `udp:34197-34297` (101 ports) directly to nodes.
   - In `hack/deploy.sh`, adding any number of maps to `WORLDS` dynamically templates their sequential `containerPort` and `hostPort` entries into the pod specification without LoadBalancer rule limits.
 
+### Trade-off 15: Multi-Zone Spot `ComputeClass` Cascade & 30-Second Make-Before-Break Preemption Shield
+* **The Constraint:**
+  - Single-zone Spot node pools (`us-central1-a`) are vulnerable to localized GCE Spot capacity stockouts and 30-second Spot VM preemptions.
+  - Traditional Kubernetes game servers backed by a zonal `ReadWriteOnce` Persistent Disk (`PVC`) cannot fail over across zones (`us-central1-b/c/f`) when their zone runs out of Spot capacity.
+  - Furthermore, gVisor (`runsc`) `SNAPSHOT_CONTENT_SCOPE_FULL` memory restores validate host `CPUID` feature compatibility between the checkpointing node and the restoring node.
+* **Our Solution (`ComputeClass` + Gateway Preemption Shield):**
+  - **1. Regional State Decoupling via GCS:** Because suspended Factorio worlds live in a regional/multi-regional Google Cloud Storage bucket (`gs://<BUCKET>`) rather than on a zonal PVC, worker pods are 100% stateless and can schedule in **any zone (`us-central1-a`, `us-central1-b`, `us-central1-c`, `us-central1-f`)** with `locationPolicy: ANY`.
+  - **2. CPUID-Consistent `ComputeClass` Cascade (`factorio-substrate-worker`):** We define a `cloud.google.com/v1` `ComputeClass` with `nodePoolAutoCreation: {enabled: true}` and `activeMigration: {optimizeRulePriority: true}` that cascades across:
+    1. **Priority 1:** Spot `n2-standard-2` (`minCpuPlatform: "Intel Ice Lake"`) across any zone in `us-central1`.
+    2. **Priority 2:** Spot `n2-standard-4` (`minCpuPlatform: "Intel Ice Lake"`) across any zone in `us-central1`.
+    3. **Priority 3:** On-Demand `n2-standard-2` (`minCpuPlatform: "Intel Ice Lake"`) across any zone if Spot is exhausted region-wide (automatically migrating back to Priority 1 Spot via Active Migration once Spot capacity returns).
+    Because every priority tier pins `Intel Ice Lake`, gVisor `SNAPSHOT_SCOPE_FULL` memory snapshots restore in ~1.5s across all zones and Spot/On-Demand tiers.
+  - **3. 30-Second Spot Preemption Shield (`EvacuatePreemptingWorkers`):** `factorio-gateway` monitors active `WorkerPool` pods and their underlying GKE nodes for GCE termination notices (`TerminationNotice`, `cloud.google.com/impending-node-termination`, or node drain `spec.unschedulable`). Within 1 second of a preemption notice:
+    - Surges `WorkerPool/factorio` `spec.replicas` (`1 -> 2`) at `t = 0s` so GKE `ComputeClass` immediately starts provisioning or claiming a replacement node.
+    - Executes `/prepare-suspend` (RCON `/server-save` + `/version` barrier) and `SuspendActor`, checkpointing the running world's RAM and `/factorio` save to GCS in **~2.5–3.5 seconds** (well inside GCE's 30-second Spot grace window).
+    - Removes the preempted worker pod and immediately transitions the world back to `RESUMING` so it rehydrates onto the replacement node automatically.
+
+
 

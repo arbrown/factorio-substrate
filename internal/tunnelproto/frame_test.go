@@ -16,6 +16,7 @@ package tunnelproto
 
 import (
 	"bytes"
+	"net"
 	"testing"
 )
 
@@ -107,5 +108,39 @@ func TestVersionParsingAndComparison(t *testing.T) {
 	}
 	if cmp := CompareVersions("2.1.24", "2.1.24"); cmp != 0 {
 		t.Errorf("CompareVersions(2.1.24, 2.1.24) = %d, want 0", cmp)
+	}
+}
+
+func TestIsIgnoredClientAddr(t *testing.T) {
+	tests := []struct {
+		name string
+		addr *net.UDPAddr
+		want bool
+	}{
+		{name: "nil", addr: nil, want: true},
+		{name: "zero port", addr: &net.UDPAddr{IP: net.IPv4(34, 125, 1, 90), Port: 0}, want: true},
+		{name: "gce metadata dns", addr: &net.UDPAddr{IP: net.IPv4(169, 254, 169, 254), Port: 53}, want: true},
+		{name: "gce metadata non-dns ipv4", addr: &net.UDPAddr{IP: net.IPv4(169, 254, 169, 254), Port: 45000}, want: true},
+		{name: "gce metadata ipv4-mapped ipv6", addr: &net.UDPAddr{IP: net.ParseIP("::ffff:169.254.169.254"), Port: 45000}, want: true},
+		{name: "link-local ipv4", addr: &net.UDPAddr{IP: net.IPv4(169, 254, 1, 2), Port: 34197}, want: true},
+		{name: "link-local ipv6", addr: &net.UDPAddr{IP: net.ParseIP("fe80::1"), Port: 45000}, want: true},
+		{name: "public dns reflection", addr: &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 53}, want: true},
+		{name: "unspecified ipv4", addr: &net.UDPAddr{IP: net.IPv4zero, Port: 45000}, want: true},
+		{name: "unspecified ipv6", addr: &net.UDPAddr{IP: net.IPv6zero, Port: 45000}, want: true},
+		{name: "multicast ipv4", addr: &net.UDPAddr{IP: net.IPv4(224, 0, 0, 1), Port: 45000}, want: true},
+		{name: "multicast ipv6", addr: &net.UDPAddr{IP: net.ParseIP("ff02::1"), Port: 45000}, want: true},
+		{name: "loopback ipv4 allowed", addr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 54321}, want: false},
+		{name: "loopback ipv6 allowed", addr: &net.UDPAddr{IP: net.IPv6loopback, Port: 54321}, want: false},
+		{name: "home client allowed", addr: &net.UDPAddr{IP: net.IPv4(136, 36, 95, 238), Port: 43969}, want: false},
+		{name: "cloudtop probe allowed", addr: &net.UDPAddr{IP: net.IPv4(34, 125, 1, 90), Port: 12288}, want: false},
+		{name: "vpc internal allowed", addr: &net.UDPAddr{IP: net.IPv4(10, 128, 0, 29), Port: 50000}, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsIgnoredClientAddr(tc.addr); got != tc.want {
+				t.Errorf("IsIgnoredClientAddr(%v) = %v, want %v", tc.addr, got, tc.want)
+			}
+		})
 	}
 }
