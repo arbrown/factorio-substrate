@@ -20,3 +20,6 @@ coverage.txt
 
 # Local cost estimates (do not publish)
 COST_ESTIMATES.md
+
+# Local asciinema recordings for blog posts
+casts/

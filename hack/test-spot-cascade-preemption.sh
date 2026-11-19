@@ -35,14 +35,29 @@ load_env
 ensure_kubectl_ate
 resolve_worlds
 
+for arg in "$@"; do
+  case "${arg}" in
+    --simulate-zone-stockout) SIMULATE_ZONE_STOCKOUT=true ;;
+    *) die "unknown argument: ${arg} (supported: --simulate-zone-stockout)" ;;
+  esac
+done
+SIMULATE_ZONE_STOCKOUT="${SIMULATE_ZONE_STOCKOUT:-false}"
+
 PF_PID=""
 PF_PORT=""
 PREEMPTED_NODES=()
+ZONE_STOCKOUT_ACTIVE=false
 
 cleanup() {
   if [[ -n "${PF_PID}" ]]; then
     kill "${PF_PID}" >/dev/null 2>&1 || true
     PF_PID=""
+  fi
+  if [[ "${ZONE_STOCKOUT_ACTIVE}" == "true" ]]; then
+    echo "==> Restoring full multi-zone ComputeClass (${WORKER_ZONES}) and WorkerPool affinity..."
+    render_computeclass_yaml | kubectl apply -f - >/dev/null 2>&1 || true
+    kubectl patch workerpool factorio -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"remove","path":"/spec/template/nodeAffinity"}]' >/dev/null 2>&1 || true
   fi
   for node in "${PREEMPTED_NODES[@]+"${PREEMPTED_NODES[@]}"}"; do
     [[ -z "${node}" ]] && continue
@@ -179,6 +194,20 @@ PREV_EVAC="$(curl -fsS "http://127.0.0.1:${PF_PORT}/status" | jq -r '.preemption
 HOP1_START_MS="$(date +%s%3N)"
 PREEMPTED_NODES+=("${NODE_1}")
 
+if [[ "${SIMULATE_ZONE_STOCKOUT}" == "true" ]]; then
+  REMAINING_ZONES_JSON="$(python3 -c '
+import json, os, sys
+excl = sys.argv[1]
+zones = [z.strip() for z in os.environ.get("WORKER_ZONES", "").split(",") if z.strip() and z.strip() != excl]
+assert zones, f"no remaining zones after excluding {excl}"
+print(json.dumps(zones))
+' "${ZONE_1}")"
+  step "Simulating zonal Spot stockout in ${ZONE_1} (remaining ComputeClass zones: ${REMAINING_ZONES_JSON})"
+  ZONE_STOCKOUT_ACTIVE=true
+  kubectl patch computeclass factorio-substrate-worker --type=merge \
+    -p "{\"spec\":{\"priorityDefaults\":{\"location\":{\"zones\":${REMAINING_ZONES_JSON}}}}}"
+fi
+
 kubectl cordon "${NODE_1}"
 kubectl taint node "${NODE_1}" cloud.google.com/impending-node-termination=true:NoSchedule --overwrite
 
@@ -200,6 +229,13 @@ for _ in $(seq 1 60); do
 done
 [[ -n "${HOP1_EVAC_DONE_MS}" ]] || die "Hop 1 Spot Preemption Shield did not trigger within 30s"
 
+if [[ "${SIMULATE_ZONE_STOCKOUT}" == "true" ]]; then
+  # Apply WorkerPool zone anti-affinity AFTER checkpointing so the active pod is
+  # never rolled out before Spot Preemption Shield saves world-vanilla to GCS.
+  kubectl patch workerpool factorio -n "${NAMESPACE}" --type=merge \
+    -p "{\"spec\":{\"template\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"topology.kubernetes.io/zone\",\"operator\":\"NotIn\",\"values\":[\"${ZONE_1}\"]}]}]}}}}}"
+fi
+
 step "Measuring Hop 1 UDP client reconnect time onto cold ComputeClass replacement node..."
 go run ./cmd/factorio-probe --addr="${EXTERNAL_IP}:${PORT_VANILLA}" --timeout=240s
 HOP1_RECOVER_END_MS="$(date +%s%3N)"
@@ -211,6 +247,12 @@ IFS='|' read -r ZONE_2 TYPE_2 SPOT_2 <<< "$(node_metadata "${NODE_2}")"
 
 if [[ "${NODE_2}" == "${NODE_1}" || "${POD_2}" == "${POD_1}" ]]; then
   die "Expected Hop 1 failover onto a distinct node/pod (got pod=${POD_2}, node=${NODE_2})"
+fi
+if [[ "${SIMULATE_ZONE_STOCKOUT}" == "true" ]]; then
+  if [[ "${ZONE_2}" == "${ZONE_1}" ]]; then
+    die "Expected cross-zone failover out of stocked-out zone ${ZONE_1}, but replacement landed in ${ZONE_2}"
+  fi
+  ok "Cross-Zone Failover Confirmed: ${ZONE_1}  -->  ${ZONE_2} (node=${NODE_2}, type=${TYPE_2}, spot=${SPOT_2})"
 fi
 
 step "Verifying Hop 1 in-game state on ${POD_2} (${NODE_2}, zone=${ZONE_2}, type=${TYPE_2}, spot=${SPOT_2}):"
@@ -310,6 +352,9 @@ echo " 2-HOP SPOT PREEMPTION CASCADE SUMMARY"
 echo "--------------------------------------------------------------------------------"
 printf " Initial Placement:        pod=%s node=%s zone=%s type=%s spot=%s\n" "${POD_1}" "${NODE_1}" "${ZONE_1}" "${TYPE_1}" "${SPOT_1}"
 printf " Hop 1 (Cold Replacement): pod=%s node=%s zone=%s type=%s spot=%s\n" "${POD_2}" "${NODE_2}" "${ZONE_2}" "${TYPE_2}" "${SPOT_2}"
+if [[ "${ZONE_2}" != "${ZONE_1}" ]]; then
+  printf "   - Zone Failover:        %s  -->  %s (cross-zone Spot stockout recovery!)\n" "${ZONE_1}" "${ZONE_2}"
+fi
 printf "   - GCS Checkpoint:       %sms (vs 30,000ms GCE Spot grace period)\n" "${HOP1_CHECKPOINT_MS}"
 printf "   - Total Failover Time:  %sms\n" "${HOP1_TOTAL_MS}"
 if (( HOP1_TOTAL_MS <= 15000 )); then
