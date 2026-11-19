@@ -798,3 +798,58 @@ func TestGatewaySpotPreemptionShieldMakeBeforeBreak(t *testing.T) {
 		t.Fatalf("post-evacuation ReadFromUDP failed: %v", err)
 	}
 }
+
+func TestGatewayDropsLinkLocalAndDNSPackets(t *testing.T) {
+	suspender := &fakeSuspender{}
+	gw := NewGateway(GatewayConfig{
+		UDPBindIP:          "127.0.0.1",
+		RouterHTTPAddr:     "127.0.0.1:1",
+		IdleTimeout:        10 * time.Second,
+		WSRotateInterval:   10 * time.Second,
+		PreemptIdleGrace:   50 * time.Millisecond,
+		MaxActiveWorlds:    1,
+		RequireFactorioPkt: false,
+		Routes: []RouteSpec{
+			{UDPPort: 0, Atespace: "factorio", Actor: "world-vanilla"},
+		},
+	}, suspender)
+
+	vanillaWT := gw.worlds["factorio/world-vanilla"]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	probe := tunnelproto.BuildFactorioProbePacket(777)
+	ignoredAddrs := []*net.UDPAddr{
+		{IP: net.IPv4(169, 254, 169, 254), Port: 53},
+		{IP: net.IPv4(169, 254, 42, 1), Port: 51234},
+		{IP: net.ParseIP("::ffff:169.254.169.254"), Port: 51234},
+		{IP: net.IPv4(8, 8, 8, 8), Port: 53},
+	}
+
+	for _, addr := range ignoredAddrs {
+		// Send twice in a row to cover both IsLikelyFactorioClientPacket and the
+		// 2-packet burstTracker path.
+		vanillaWT.handleInboundUDP(ctx, addr, probe)
+		vanillaWT.handleInboundUDP(ctx, addr, probe)
+	}
+
+	if got, want := vanillaWT.scannerDropped.Load(), uint64(len(ignoredAddrs)*2); got != want {
+		t.Fatalf("scannerDropped = %d, want %d", got, want)
+	}
+	if got := vanillaWT.wakeCount.Load(); got != 0 {
+		t.Fatalf("wakeCount = %d, want 0", got)
+	}
+	if got := vanillaWT.packetsRx.Load(); got != 0 {
+		t.Fatalf("packetsRx = %d, want 0", got)
+	}
+	vanillaWT.mu.Lock()
+	state := vanillaWT.state
+	clients := len(vanillaWT.clientAddrs)
+	vanillaWT.mu.Unlock()
+	if state != WorldStateSuspended {
+		t.Fatalf("state = %q, want %q", state, WorldStateSuspended)
+	}
+	if clients != 0 {
+		t.Fatalf("len(clientAddrs) = %d, want 0", clients)
+	}
+}

@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -224,4 +226,28 @@ func IsLikelyFactorioClientPacket(pkt []byte) bool {
 	default:
 		return false
 	}
+}
+
+// IsIgnoredClientAddr reports whether an inbound UDP source address must be
+// dropped before waking or forwarding to a Factorio Actor.
+//
+// When factorio-gateway exposes UDP hostPorts (34197+) inside Linux's default
+// ephemeral port range (32768-60999), CNI portmap DNAT can redirect node-local
+// GCE metadata/DNS replies from 169.254.169.254:53 into the gateway socket
+// whenever a host-network process picks a matching ephemeral source port.
+// Loopback (127.0.0.0/8, ::1) remains allowed for local probes and unit tests.
+func IsIgnoredClientAddr(addr *net.UDPAddr) bool {
+	if addr == nil || addr.Port <= 0 || addr.Port == 53 {
+		return true
+	}
+	ip, ok := netip.AddrFromSlice(addr.IP)
+	if !ok {
+		return true
+	}
+	ip = ip.Unmap()
+	return !ip.IsValid() ||
+		ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast()
 }

@@ -904,6 +904,10 @@ func (wt *WorldTunnel) udpReadLoop(ctx context.Context) {
 }
 
 func (wt *WorldTunnel) handleInboundUDP(ctx context.Context, raddr *net.UDPAddr, pkt []byte) {
+	if tunnelproto.IsIgnoredClientAddr(raddr) {
+		wt.scannerDropped.Add(1)
+		return
+	}
 	clientKey := raddr.String()
 	now := time.Now()
 	clientVer, hasClientVer := tunnelproto.ParseClientVersion(pkt)
