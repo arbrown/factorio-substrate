@@ -16,13 +16,14 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 .PHONY: help cluster gcp install-substrate optimize-cluster \
+	observability observability-off observability-on observability-status \
 	namespace computeclass workerpool gateway actor-template actors deploy up \
-	test build verify verify-with-idle prove test-preemption \
+	test build verify verify-with-idle prove test-preemption test-preemption-zone-failover \
 	watch watch-transitions status check-update \
 	teardown delete-gcp delete-cluster destroy clean
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  Configure '.env' first: cp .env.example .env (set PROJECT_ID)"
 
@@ -37,6 +38,18 @@ install-substrate: ## Install Agent Substrate (ate-system) & build bin/kubectl-a
 
 optimize-cluster: ## Migrate to Spot control-pool, compact Postgres (10Gi), & multi-zone ComputeClass
 	@./hack/setup-cost-optimized-pools.sh
+
+observability: ## Apply observability settings from .env (GKE logging/monitoring, Prometheus, ATE log level)
+	@./hack/observability.sh apply
+
+observability-off: ## Silence ATE/workload Cloud Logging, set ate-api-server=error, & disable Managed Prometheus
+	@./hack/observability.sh off
+
+observability-on: ## Re-enable workload Cloud Logging, ate-api-server=info (or ATE_API_LOG_LEVEL=debug), & Managed Prometheus
+	@./hack/observability.sh on
+
+observability-status: ## Show current GKE logging, Managed Prometheus, and ate-api-server log level
+	@./hack/observability.sh status
 
 namespace: ## Apply manifests/namespace.yaml and manifests/rbac.yaml
 	@./hack/deploy-k8s.sh namespace
@@ -83,8 +96,11 @@ verify-with-idle: ## Verify 30s idle auto-suspend & restore 10m IDLE_TIMEOUT
 prove: ## Run full stateful RCON chest + GCS eviction/restore proof
 	@./hack/prove-e2e.sh
 
-test-preemption: ## Simulate 2-hop Spot preemption cascade & measure failover latency
+test-preemption: ## Simulate 2-hop Spot preemption cascade [SIMULATE_ZONE_STOCKOUT=true]
 	@./hack/test-spot-cascade-preemption.sh
+
+test-preemption-zone-failover: ## Simulate 2-hop Spot preemption with zonal stockout (forces cross-zone failover)
+	@SIMULATE_ZONE_STOCKOUT=true ./hack/test-spot-cascade-preemption.sh
 
 watch: ## Watch Actors, WorkerPool, Nodes, & gateway status live
 	@./hack/watch-actors.sh

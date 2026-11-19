@@ -50,13 +50,18 @@ load_env
 [[ "${KO_DOCKER_REPO}" == "us-central1-docker.pkg.dev/test-proj-123/factorio-ate" ]]
 [[ "${SUBSTRATE_IMAGE_REPO}" == "ghcr.io/agent-substrate/substrate" ]]
 [[ "${GKE_CLUSTER_VERSION}" == "1.37" ]]
+[[ "${ATE_API_LOG_LEVEL}" == "error" ]]
+[[ "${GKE_LOGGING}" == "SYSTEM" ]]
+[[ "${GKE_MONITORING}" == "SYSTEM" ]]
+[[ "${GKE_MANAGED_PROMETHEUS}" == "false" ]]
 
 # Verify CLI overrides beat .env values
-IDLE_TIMEOUT=45s WORLDS_LIST="world-a world-b" WORKER_ZONES="us-east1-b,us-east1-c" bash -euo pipefail <<'INNER'
+IDLE_TIMEOUT=45s WORLDS_LIST="world-a world-b" WORKER_ZONES="us-east1-b,us-east1-c" ATE_API_LOG_LEVEL=debug bash -euo pipefail <<'INNER'
 source hack/lib.sh
 load_env
 [[ "${IDLE_TIMEOUT}" == "45s" ]]
 [[ "${WORLDS_LIST}" == "world-a world-b" ]]
+[[ "${ATE_API_LOG_LEVEL}" == "debug" ]]
 
 render_computeclass_yaml | python3 -c '
 import sys, yaml

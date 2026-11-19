@@ -35,6 +35,10 @@ if gcloud container clusters describe "${CLUSTER_NAME}" \
   ok "Cluster ${CLUSTER_NAME} (${CLUSTER_LOCATION}) already exists"
 else
   step "Creating GKE cluster ${CLUSTER_NAME} in ${CLUSTER_LOCATION} (version=${GKE_CLUSTER_VERSION}, pool=${CLUSTER_INIT_MACHINE_TYPE} Spot)"
+  # Keep GKE's default Managed Prometheus enabled during initial bootstrap so
+  # crd/podmonitorings.monitoring.googleapis.com exists when `make install-substrate`
+  # applies atenet-router-monitoring.yaml; `make optimize-cluster` then disables it
+  # (alongside WORKLOAD Cloud Logging) via `hack/observability.sh apply`.
   create_args=(
     --project="${PROJECT_ID}"
     --zone="${CLUSTER_LOCATION}"

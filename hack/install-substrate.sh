@@ -38,6 +38,7 @@ setup_args=(
   --snapshot-transfer-gsa-name="${SNAPSHOT_TRANSFER_GSA_NAME}"
   --ingress-allowed-spiffe-ids="${ATE_INGRESS_ALLOWED_SPIFFE_IDS}"
   --ateapi-authz-bootstrap-owners="${ATE_API_AUTHZ_BOOTSTRAP_OWNERS}"
+  --ateapi-log-level="${ATE_API_LOG_LEVEL}"
   --gcp-project-id="${PROJECT_ID}"
   --gcp-cluster-location="${CLUSTER_LOCATION}"
   --gcp-cluster-name="${CLUSTER_NAME}"

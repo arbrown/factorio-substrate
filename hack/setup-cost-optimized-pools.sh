@@ -245,6 +245,8 @@ render_computeclass_yaml | kubectl apply -f -
 
 ensure_udp_firewall_rule
 
+"${REPO_ROOT}/hack/observability.sh" apply
+
 step "Waiting for ate-system workloads after node pool migration"
 kubectl -n ate-system wait --for=condition=Available deploy --all --timeout=5m
 kubectl -n ate-system rollout status sts/postgres --timeout=5m

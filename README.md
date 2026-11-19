@@ -60,12 +60,16 @@ For personal/home use, keeping worker nodes running 24/7 or paying for cloud Loa
    - **Priority 2:** Spot `n2-standard-4` (Intel Ice Lake) in any zone if `n2-standard-2` Spot is stocked out
    - **Priority 3:** On-Demand `n2-standard-2` (Intel Ice Lake) fallback if Spot is stocked out region-wide
 3. **30-Second Spot Preemption Shield (`EvacuatePreemptingWorkers`):** `factorio-gateway` watches worker nodes every 1s for `cloud.google.com/impending-node-termination` / `TerminationNotice` / unschedulable cordons. When triggered, it immediately surges `WorkerPool` `spec.replicas` to `MaxActiveWorlds+1`, checkpoints running worlds to GCS via RCON `/server-save` + `SuspendActor` (~2.5–3.5s, comfortably inside GCE's 30s termination grace window), force-deletes the dying worker pod, and auto-resumes onto the replacement `ComputeClass` node with zero item or save loss.
-4. **Direct `hostPort` Ingress (Arbitrary Maps):** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`<CLUSTER_NAME>-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to [`manifests/actors.yaml`](manifests/actors.yaml) or `WORLDS_LIST` in `.env` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits.
+4. **Direct `hostPort` Ingress & Link-Local/DNS Filtering:** Replaces the GKE `LoadBalancer` Service with direct node `hostPort` bindings on `factorio-gateway` (`strategy: Recreate`) coupled with a GCP VPC firewall rule (`<CLUSTER_NAME>-allow-udp-hostport`) allowing `udp:34197-34297` (101 ports). Adding any number of maps to [`manifests/actors.yaml`](manifests/actors.yaml) or `WORLDS_LIST` in `.env` automatically binds and exposes their ports without hitting LoadBalancer forwarding rule limits. Because Linux ephemeral client ports (`32768–60999`) overlap `34197+`, `factorio-gateway` drops link-local (`169.254.0.0/16`, `fe80::/10`), bogon/multicast, and DNS source port `53` packets before waking Actors so node-local GCE metadata DNS replies (`169.254.169.254:53`) never trigger phantom wakes.
 5. **Gateway Ingress Cold Wake & Automatic Scale-to-Zero:** On the first inbound UDP packet, `factorio-gateway` scales `WorkerPool/factorio` `0 -> 1`. When all worlds remain suspended for `--workerpool-idle-timeout` (default `2m`), `factorio-gateway` scales `WorkerPool/factorio` `1 -> 0` so GKE NAP reclaims worker nodes to zero.
-6. **Cost-Optimized Control Pool & Multi-Zone Cascade:**
+6. **Cost-Optimized Control Pool, Multi-Zone Cascade, & Quiet Observability:**
    ```bash
-   make optimize-cluster   # Runs ./hack/setup-cost-optimized-pools.sh
+   make optimize-cluster      # Runs ./hack/setup-cost-optimized-pools.sh (and applies quiet observability)
+   make observability-status  # Check GKE logging, Managed Prometheus, and ate-api-server log level
+   make observability-on      # Re-enable WORKLOAD logs, ate-api-server=info, & Managed Prometheus for debugging
+   make observability-off     # Restore quiet idle defaults (SYSTEM-only logs/metrics, Prometheus off, ateapi=error)
    ```
+   By default (`.env.example`), `install-substrate` sets `ATE_API_LOG_LEVEL=error` via `ate-setup` and `optimize-cluster` applies `GKE_LOGGING=SYSTEM`, `GKE_MONITORING=SYSTEM`, and `GKE_MANAGED_PROMETHEUS=false` via GKE cluster flags (`kubectl logs` still works live; pass `ATE_API_LOG_LEVEL=debug make observability-on` when debugging Substrate).
 
 ### Automatic Zero-Touch Factorio Version Upgrades (Proactive + Reactive)
 Because Steam auto-updates players' Factorio clients whenever Wube releases a new `stable` patch, `factorio-gateway` implements a **dual auto-upgrade system**:
@@ -94,7 +98,7 @@ Because Steam auto-updates players' Factorio clients whenever Wube releases a ne
 - [`.env.example`](.env.example) — Sample environment template (`PROJECT_ID`, GKE version, Artifact Registry, Substrate image source, and gateway tuning). Copy to `.env` (gitignored).
 - [`Makefile`](Makefile) — Granular targets (`make help`) covering cluster creation, GCP setup, Substrate install, pool cost optimization, individual manifest apply steps, E2E verification, and teardown.
 - [`hack/`](hack/) — Modular lifecycle scripts:
-  - `create-cluster.sh`, `gcp-resources.sh`, `install-substrate.sh`, `setup-cost-optimized-pools.sh` — Infrastructure & Substrate installation.
+  - `create-cluster.sh`, `gcp-resources.sh`, `install-substrate.sh`, `setup-cost-optimized-pools.sh`, `observability.sh` — Infrastructure, Substrate installation, & observability toggles.
   - `deploy-k8s.sh`, `deploy-actors.sh`, `deploy.sh` — Granular manifest application (`namespace`, `computeclass`, `workerpool`, `gateway`, `actor-template`, `actors`).
   - `teardown.sh`, `delete-cluster.sh` — Workload, GCP, and GKE cluster cleanup (`make teardown`, `make destroy`).
   - `test-e2e.sh`, `prove-e2e.sh`, `test-spot-cascade-preemption.sh`, `watch-actors.sh` — Automated verification, Spot preemption cascade testing, and live monitoring.
